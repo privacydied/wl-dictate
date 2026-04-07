@@ -12,19 +12,21 @@ import sounddevice as sd
 from scipy.io import wavfile
 
 # Config
-CHUNK_DURATION = 5  # seconds
+CHUNK_DURATION = 3     # seconds per recording chunk
 SAMPLE_RATE = 16000
 CHANNELS = 1
 WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
-WHISPER_MODEL = "whisper.cpp/models/ggml-base.en.bin"
-WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+WHISPER_MODEL_NAME = "tiny.en"  # tiny.en = near-instant on CPU
+DESIRED_MODEL_PATH = f"whisper.cpp/models/ggml-{WHISPER_MODEL_NAME}.bin"
+VAD_RMS_THRESHOLD = 300  # skip whisper if RMS below this (silence)
+THREADS = 16             # Ryzen 3700X has 8C/16T
+WHISPER_TIMEOUT = 30
+WTYPE_TIMEOUT = 10
+DEBUG_MODE = True
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WHISPER_LIB_DIR = os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "src")
-DEBUG_MODE = True  # Set to False in production
-THREADS = 4  # Number of threads for whisper-cli
-WHISPER_TIMEOUT = 60  # max seconds for whisper-cli to transcribe one chunk
-WTYPE_TIMEOUT = 10  # max seconds for wtype to type the text
-
+WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
 
 def _ensure_whisper_cli():
     """Build whisper-cli from the whisper.cpp submodule if the binary is missing."""
@@ -48,39 +50,40 @@ def _ensure_whisper_cli():
 
 
 def _ensure_whisper_model():
-    """Download the ggml-base.en model if it's missing."""
-    if os.path.isfile(WHISPER_MODEL):
+    """Download the configured whisper model if it's missing."""
+    if os.path.isfile(DESIRED_MODEL_PATH):
         return
-    print(f"Whisper model not found -- downloading {WHISPER_MODEL_URL} ...")
-    model_dir = os.path.dirname(WHISPER_MODEL)
+    url = WHISPER_MODEL_URL.format(name=WHISPER_MODEL_NAME)
+    print(f"Whisper model not found -- downloading {url} ...")
+    model_dir = os.path.dirname(DESIRED_MODEL_PATH)
     os.makedirs(model_dir, exist_ok=True)
 
-    download_script = os.path.join(os.path.dirname(WHISPER_MODEL), "download-ggml-model.sh")
+    download_script = os.path.join(model_dir, "download-ggml-model.sh")
     if os.path.isfile(download_script):
         subprocess.check_call(
-            [download_script, "base.en"],
-            cwd=os.path.dirname(WHISPER_MODEL),
+            [download_script, WHISPER_MODEL_NAME],
+            cwd=model_dir,
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
     elif shutil.which("curl"):
-        dest = os.path.join(model_dir, os.path.basename(WHISPER_MODEL))
+        dest = os.path.join(model_dir, os.path.basename(DESIRED_MODEL_PATH))
         subprocess.check_call(
-            ["curl", "-#L", "-o", dest, WHISPER_MODEL_URL],
+            ["curl", "-#L", "-o", dest, url],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
     elif shutil.which("wget"):
         subprocess.check_call(
-            ["wget", "-O", os.path.join(model_dir, os.path.basename(WHISPER_MODEL)), WHISPER_MODEL_URL],
+            ["wget", "-O", os.path.join(model_dir, os.path.basename(DESIRED_MODEL_PATH)), url],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
     else:
-        print(f"No curl or wget available to download the model. Download manually from {WHISPER_MODEL_URL}")
+        print(f"No curl or wget available. Download manually from {url}")
         sys.exit(1)
 
-    if not os.path.isfile(WHISPER_MODEL):
+    if not os.path.isfile(DESIRED_MODEL_PATH):
         print("Model download failed -- file not found after download")
         sys.exit(1)
     print("Whisper model downloaded successfully")
@@ -187,8 +190,8 @@ def record_chunk(duration, device_id=None):
     audio = sd.rec(int(duration * input_sr),
                    samplerate=input_sr,
                    channels=input_channels,
-                   dtype="float32",
-                   device=device_idx)
+                   dtype='float32',
+                   device=device_idx)  # None means default
     sd.wait()
 
     # Handle multi-dimensional audio
@@ -197,20 +200,17 @@ def record_chunk(duration, device_id=None):
 
     # Validate audio
     if audio is None or len(audio) == 0 or np.isnan(audio).any():
-        print("Skipping invalid or empty audio buffer")
+        print("Warning: Invalid or empty audio buffer")
         return None
 
     # Downmix to mono if needed
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
 
-    # Resample to 16kHz if needed
+    # Resample to 16kHz
     if input_sr != SAMPLE_RATE:
         duration_original = len(audio) / input_sr
         target_length = int(SAMPLE_RATE * duration_original)
-        if target_length == 0:  # [W1] guard against zero-length linspace
-            print("Audio chunk too short to resample, skipping")
-            return None
         audio = np.interp(
             np.linspace(0, len(audio), target_length, endpoint=False),
             np.arange(len(audio)),
@@ -221,49 +221,53 @@ def record_chunk(duration, device_id=None):
     audio *= 32767
     audio = np.clip(audio, -32768, 32767).astype(np.int16)
 
-    # Check audio level
+    # Check audio level — return None if too quiet (skip whisper)
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-    print(f"Audio RMS: {rms:.2f}")
-    if rms < 100:
-        print("Warning: Audio level very low")
+    if DEBUG_MODE:
+        print(f"Audio RMS: {rms:.2f}")
+    if rms < VAD_RMS_THRESHOLD:
+        if DEBUG_MODE:
+            print("Skipping silence")
+        return None
 
     return audio
 
 
 def transcribe_and_type(audio):
+    """Transcribe audio via whisper-cli and type the result with wtype."""
+    import traceback as _traceback
+
     if audio is None:
         return
 
-    # Resolve WHISPER_BINARY relative to SCRIPT_DIR if needed
-    if not os.path.isabs(WHISPER_BINARY):
-        binary_path = os.path.join(SCRIPT_DIR, WHISPER_BINARY)
-    else:
-        binary_path = WHISPER_BINARY
+    binary_path = os.path.join(SCRIPT_DIR, WHISPER_BINARY)
+    model_path = os.path.join(SCRIPT_DIR, DESIRED_MODEL_PATH)
+    run_env = os.environ.copy()
+    run_env["LD_LIBRARY_PATH"] = WHISPER_LIB_DIR
 
-    # Resolve WHISPER_MODEL relative to SCRIPT_DIR
-    if not os.path.isabs(WHISPER_MODEL):
-        model_path = os.path.join(SCRIPT_DIR, WHISPER_MODEL)
-    else:
-        model_path = WHISPER_MODEL
-
-    # Validate binaries before doing any work
-    if not os.path.isfile(binary_path):
-        print(f"whisper-cli not found at {binary_path}")
-        return
-    if shutil.which("wtype") is None and not os.path.isfile("/usr/bin/wtype"):
-        print("wtype is not installed or not in PATH")
-        return
-
-    # Validate model
-    if not os.path.isfile(model_path):
-        print(f"Whisper model not found at {model_path}")
-        return
-
-    # Ensure wtype can reach the active display
     if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
 
-    # Save audio to WAV file
+    # Save audio to WAV
+    try:
+        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+        wavfile.write(wav_path, SAMPLE_RATE, audio)
+    except Exception as e:
+        print(f"Failed to write WAV: {e}")
+        return
+
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    if DEBUG_MODE:
+        print(f"Audio RMS: {rms:.1f}")
+
+    # Skip silence to avoid wasting 2s on "(wind blowing)" for ambient noise
+    if rms < VAD_RMS_THRESHOLD:
+        if DEBUG_MODE:
+            print("Silence detected — skipping transcription")
+        return
+
+    # Save audio to WAV
     wav_fd = None
     wav_path = None
     try:
@@ -272,8 +276,6 @@ def transcribe_and_type(audio):
         wavfile.write(wav_path, SAMPLE_RATE, audio)
     except Exception as e:
         print(f"Failed to write WAV: {e}")
-        if wav_path and os.path.exists(wav_path):
-            os.unlink(wav_path)
         return
 
     if DEBUG_MODE:
@@ -292,24 +294,25 @@ def transcribe_and_type(audio):
             env=run_env,
         )
 
-        # Extract transcription from stdout
         output = result.stdout
         if DEBUG_MODE:
             print(f"Raw whisper output: {output}")
 
-        # Parse transcription
         transcription = output.strip()
         if transcription:
-            # Remove SRT-style bracketed timestamps
+            # Remove SRT timestamps and index lines
             cleaned = re.sub(r"\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*", "", transcription)
-            # Remove timestamps at line start
             cleaned = re.sub(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\s*", "", cleaned, flags=re.MULTILINE)
-            # Remove standalone numeric index lines
             cleaned = re.sub(r"^\d+\s*$", "", cleaned, flags=re.MULTILINE)
-            # Remove residual trailing bracketed timestamps
             cleaned = re.sub(r"\s*\[\d{2}:\d{2}:\d{2}\.\d{3}.*", "", cleaned)
-            # Remove empty lines and join
             cleaned = " ".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
+
+            # Strip non-speech annotations: (heavy breathing), [Music], etc.
+            cleaned = re.sub(r"\([^)]*\)\s*", "", cleaned)
+            cleaned = re.sub(r"\[[^\]]*\]\s*", "", cleaned)
+
+            # Collapse extra whitespace
+            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
 
             if not cleaned:
                 print("Nothing recognized after cleanup.")
@@ -318,21 +321,23 @@ def transcribe_and_type(audio):
             if DEBUG_MODE:
                 print(f"Cleaned transcription: {repr(cleaned)}")
 
-            # Type out the transcription via wtype
+            # Type via wtype, prepending a space to separate from prior text
             try:
                 wtype_env = os.environ.copy()
                 if "DISPLAY" not in wtype_env:
-                    wtype_env["DISPLAY"] = ":0"
+                    wtype_env["DISPLAY"] = ":1"
+                wtype_env.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
+                wtype_env.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
 
                 subprocess.run(
-                    ["wtype", cleaned],
+                    ["wtype", " " + cleaned],
                     check=True,
                     timeout=WTYPE_TIMEOUT,
                     env=wtype_env,
                 )
                 print(f"Typed: {cleaned}")
             except subprocess.TimeoutExpired:
-                print("wtype timed out -- X11 may be unavailable or no focused window")
+                print("wtype timed out -- X11/Wayland may be unavailable or no focused window")
             except subprocess.CalledProcessError as e:
                 print(f"wtype failed: {e.stderr.strip() if e.stderr else e}")
             except FileNotFoundError:
@@ -342,9 +347,13 @@ def transcribe_and_type(audio):
     except subprocess.TimeoutExpired:
         print(f"whisper-cli timed out after {WHISPER_TIMEOUT}s")
     except subprocess.CalledProcessError as e:
-        print(f"Transcription failed: {e.stderr}")
+        stderr = e.stderr.strip() if e.stderr else str(e)
+        print(f"Transcription failed (exit {e.returncode}): {stderr}")
     except FileNotFoundError:
-        print(f"whisper-cli not found at {WHISPER_BINARY}")
+        print(f"whisper-cli not found at {binary_path}")
+    except Exception:
+        print("Unexpected transcription error:")
+        _traceback.print_exc()
     finally:
         if wav_path and os.path.exists(wav_path):
             os.unlink(wav_path)
