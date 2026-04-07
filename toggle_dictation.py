@@ -7,6 +7,7 @@ Usage:
     python toggle_dictation.py
     # or make it executable and point your keybinding to the full path
 """
+
 import os
 import socket
 import sys
@@ -21,24 +22,29 @@ def main():
         # Tray app not running — notify the user via system notification
         try:
             import subprocess
+
             subprocess.run(["notify-send", "Dictation", "Tray app is not running"])
         except Exception:
             pass
         sys.exit(1)
 
+    sock = None
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1)
         sock.connect(SOCKET_PATH)
         sock.sendall(b"toggle")
-        sock.close()
     except (ConnectionRefusedError, OSError) as e:
         try:
             import subprocess
+
             subprocess.run(["notify-send", "Dictation Error", str(e)])
         except Exception:
             pass
         sys.exit(1)
+    finally:
+        if sock:
+            sock.close()
 
 
 if __name__ == "__main__":

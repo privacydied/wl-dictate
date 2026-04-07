@@ -8,7 +8,6 @@ import re
 import subprocess
 import sys
 import warnings
-from collections import deque
 from queue import Empty, Queue
 
 import numpy as np
@@ -29,21 +28,20 @@ FASTER_WHISPER_DEVICE = "cuda"
 FASTER_WHISPER_COMPUTE_TYPE = "float16"
 
 # Transcription quality / performance
-TRANSCRIBE_BEAM_SIZE = 2            # tiny.en gains nothing from beam>2
-TRANSCRIBE_BATCH_SIZE = 8           # parallel segment processing in CTranslate2
-TRANSCRIBE_VAD_FILTER = True        # built-in Silero VAD trims silence from audio
+TRANSCRIBE_BEAM_SIZE = 2  # tiny.en gains nothing from beam>2
+TRANSCRIBE_VAD_FILTER = True  # built-in Silero VAD trims silence from audio
 
-BLOCK_DURATION = 0.5                # seconds per VAD evaluation block
-SILENCE_BLOCKS = 2                  # consecutive quiet blocks to flush
-MAX_SPEECH_BLOCKS = 30              # forced flush after ~15s
+BLOCK_DURATION = 0.5  # seconds per VAD evaluation block
+SILENCE_BLOCKS = 2  # consecutive quiet blocks to flush
+MAX_SPEECH_BLOCKS = 30  # forced flush after ~15s
 SAMPLE_RATE = 16000
 
-VAD_EMA_ALPHA = 0.3                 # EMA smoothing factor
-VAD_SPEECH_THRESHOLD = 200          # above this = speech begins
-VAD_SILENCE_THRESHOLD = 100         # floor for relative silence detection
-VAD_MIN_SPEECH_S = 0.3              # minimum speech duration to transcribe
-VAD_SILENCE_RATIO = 0.25            # silence when EMA drops below 25% of peak
-SILENCE_DEBLOCK_BLOCKS = 2          # hysteresis after flushing
+VAD_EMA_ALPHA = 0.3  # EMA smoothing factor
+VAD_SPEECH_THRESHOLD = 200  # above this = speech begins
+VAD_SILENCE_THRESHOLD = 100  # floor for relative silence detection
+VAD_MIN_SPEECH_S = 0.3  # minimum speech duration to transcribe
+VAD_SILENCE_RATIO = 0.25  # silence when EMA drops below 25% of peak
+SILENCE_DEBLOCK_BLOCKS = 2  # hysteresis after flushing
 
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
@@ -66,10 +64,12 @@ _WTYPE_CMD: list[str] = []
 
 # ── Bootstrap ───────────────────────────────────────────────────────────────
 
+
 def _probe_cuda_available() -> bool:
     """Check if CUDA devices are detected by CTranslate2."""
     try:
         from ctranslate2 import get_cuda_device_count  # pyright: ignore[reportMissingImports]
+
         return get_cuda_device_count() > 0
     except Exception:
         return False
@@ -87,10 +87,14 @@ def bootstrap() -> None:
         device = "cpu"
         compute_type = "int8"
 
-    print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({device}/{compute_type})...")
+    print(
+        f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({device}/{compute_type})..."
+    )
     try:
         WHISPER_MODEL = WhisperModel(
-            FASTER_WHISPER_MODEL, device=device, compute_type=compute_type,
+            FASTER_WHISPER_MODEL,
+            device=device,
+            compute_type=compute_type,
         )
         print("Model loaded successfully")
     except Exception as e:
@@ -98,7 +102,9 @@ def bootstrap() -> None:
             raise
         print(f"WARNING: Failed to load with {device}, falling back to CPU: {e}")
         WHISPER_MODEL = WhisperModel(
-            FASTER_WHISPER_MODEL, device="cpu", compute_type="int8",
+            FASTER_WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
         )
         print("Model loaded successfully (CPU fallback)")
 
@@ -110,6 +116,7 @@ def bootstrap() -> None:
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────
+
 
 def resolve_device(device_arg: str | None) -> int | None:
     """Resolve device argument to an integer device index."""
@@ -136,7 +143,6 @@ def _guess_wayland_display() -> bool:
     """Try to infer WAYLAND_DISPLAY from runtime dirs."""
     candidates = ["/run/user/1000"]
     try:
-        import pwd
         candidates.append(f"/run/user/{os.getuid()}")
     except Exception:
         pass
@@ -146,10 +152,12 @@ def _guess_wayland_display() -> bool:
         except OSError:
             continue
         if sockets:
+            display = os.path.basename(sockets[0])
+            # Atomic assignment: build all values first, then set at once
             os.environ["XDG_RUNTIME_DIR"] = candidate
-            os.environ["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
+            os.environ["WAYLAND_DISPLAY"] = display
             _WTYPE_ENV["XDG_RUNTIME_DIR"] = candidate
-            _WTYPE_ENV["WAYLAND_DISPLAY"] = os.environ["WAYLAND_DISPLAY"]
+            _WTYPE_ENV["WAYLAND_DISPLAY"] = display
             print(f"Guessed WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
             return True
     return False
@@ -157,11 +165,13 @@ def _guess_wayland_display() -> bool:
 
 # ── Transcription ───────────────────────────────────────────────────────────
 
+
 def transcribe_and_type(audio: np.ndarray) -> None:
     """Transcribe audio and type the result via wtype."""
     if WHISPER_MODEL is None:
+        print("WARNING: Whisper model not loaded, skipping transcription")
         return
-    if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
+    if "WAYLAND_DISPLAY" not in os.environ or "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
 
     audio_f32 = audio.astype(np.float32) / 32767.0
@@ -171,9 +181,10 @@ def transcribe_and_type(audio: np.ndarray) -> None:
             beam_size=TRANSCRIBE_BEAM_SIZE,
             vad_filter=TRANSCRIBE_VAD_FILTER,
             language="en",
-            condition_on_previous_text=False,   # avoid hallucination loops
+            condition_on_previous_text=False,  # avoid hallucination loops
             initial_prompt="Transcribe verbatim.",  # prime the decoder
         )
+        text = " ".join(seg.text for seg in segments).strip()
     except RuntimeError as e:
         if "libcublas" in str(e) or "CUDA" in str(e):
             print(f"WARNING: CUDA error during transcription: {e}")
@@ -183,8 +194,6 @@ def transcribe_and_type(audio: np.ndarray) -> None:
         print("Transcription error:")
         sys.excepthook(*sys.exc_info())
         return
-
-    text = " ".join(seg.text for seg in segments).strip()
     if not text:
         print("Nothing recognized.")
         return
@@ -261,12 +270,23 @@ def main(device_arg: str | None = None) -> None:
     device_idx = resolve_device(device_arg) if device_arg else None
 
     with sd.InputStream(
-        samplerate=None, channels=1, dtype="float32",
-        device=device_idx, callback=_audio_callback,
+        samplerate=None,
+        channels=1,
+        dtype="float32",
+        device=device_idx,
+        callback=_audio_callback,
         blocksize=BLOCK_SAMPLES,
     ):
         if device_idx is not None:
-            input_sr = int(sd.query_devices(device_idx, "input")["default_samplerate"])
+            dev_info = sd.query_devices(device_idx, "input")
+            raw_sr = dev_info.get("default_samplerate")
+            if raw_sr is None or raw_sr <= 0:
+                print(
+                    f"WARNING: Device {device_idx} reports invalid samplerate {raw_sr}, using default {SAMPLE_RATE}"
+                )
+                input_sr = SAMPLE_RATE
+            else:
+                input_sr = int(raw_sr)
         else:
             input_sr = SAMPLE_RATE
 
@@ -291,7 +311,8 @@ def main(device_arg: str | None = None) -> None:
                     if target_len > 0:
                         block = np.interp(
                             np.linspace(0, len(block), target_len, endpoint=False),
-                            np.arange(len(block)), block,
+                            np.arange(len(block)),
+                            block,
                         )
 
                 # Scale to int16 range for VAD thresholds
@@ -350,12 +371,16 @@ def main(device_arg: str | None = None) -> None:
 
                 # Runaway guard: force flush after MAX_SPEECH_BLOCKS
                 if _sample_count >= BLOCK_SAMPLES * MAX_SPEECH_BLOCKS:
+                    secs_before_reset = _sample_count / SAMPLE_RATE
                     _enqueue_transcribe(list(speech_chunks), "forced")
                     speech_chunks.clear()
                     _sample_count = 0
+                    silent_blocks = 0
+                    speech_peak_rms = 0.0
+                    energy_floor = float("inf")
                     in_speech = False
                     if DEBUG_MODE:
-                        print(f"  forced flush ({_sample_count / SAMPLE_RATE:.1f}s)")
+                        print(f"  forced flush ({secs_before_reset:.1f}s)")
 
         except KeyboardInterrupt:
             print("\nStopping...")

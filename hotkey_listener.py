@@ -2,7 +2,6 @@ import evdev
 import select
 import threading
 import time
-from queue import Queue
 
 
 class HotkeyListener(threading.Thread):
@@ -62,24 +61,29 @@ class HotkeyListener(threading.Thread):
 
                 with self._devices_lock:
                     devices_to_watch = list(self.keyboard_devices)
+                    all_modifiers = {
+                        evdev.ecodes.KEY_LEFTCTRL,
+                        evdev.ecodes.KEY_RIGHTCTRL,
+                        evdev.ecodes.KEY_LEFTALT,
+                        evdev.ecodes.KEY_RIGHTALT,
+                    }
                 r, w, x = select.select(devices_to_watch, [], [], 0.1)
                 for device in r:
                     try:
                         for event in device.read():
                             if event.type == evdev.ecodes.EV_KEY:
                                 scancode = event.code
-                                if event.value == 1:  # Key down
-                                    self.pressed_keys.add(scancode)
-                                elif event.value == 0:  # Key up
-                                    self.pressed_keys.discard(scancode)
-                                    # Check hotkey on release of the trigger key [H1]
-                                    if self.pressed_keys <= {
-                                        evdev.ecodes.KEY_LEFTCTRL,
-                                        evdev.ecodes.KEY_RIGHTCTRL,
-                                        evdev.ecodes.KEY_LEFTALT,
-                                        evdev.ecodes.KEY_RIGHTALT,
-                                    } and scancode == evdev.ecodes.KEY_D:
-                                        self.callback()
+                                with self._devices_lock:
+                                    if event.value == 1:  # Key down
+                                        self.pressed_keys.add(scancode)
+                                    elif event.value == 0:  # Key up
+                                        self.pressed_keys.discard(scancode)
+                                        # Check hotkey on release of the trigger key [H1]
+                                        if (
+                                            self.pressed_keys <= all_modifiers
+                                            and scancode == evdev.ecodes.KEY_D
+                                        ):
+                                            self.callback()
                     except (OSError, IOError):
                         with self._devices_lock:
                             self.keyboard_devices = []
