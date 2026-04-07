@@ -23,10 +23,10 @@ MAX_SPEECH_BLOCKS = 30
 TRANSCRIBE_CHUNK_SIZE = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
-VAD_RMS_THRESHOLD = 500         # kept for reference
+VAD_RMS_THRESHOLD = 500         # legacy, kept for reference
 VAD_EMA_ALPHA = 0.3             # EMA smoothing factor
-VAD_SPEECH_THRESHOLD = 600      # above this = speech begins
-VAD_SILENCE_THRESHOLD = 350     # below this = speech ends
+VAD_SPEECH_THRESHOLD = 200      # above this = speech begins (calibrated per-mic)
+VAD_SILENCE_THRESHOLD = 100     # below this = speech ends
 VAD_MIN_SPEECH_S = 0.3          # minimum speech duration to transcribe
 SILENCE_DEBLOCK_BLOCKS = 2      # extra silence after transcription before re-arming
 WHISPER_TIMEOUT = 30
@@ -34,6 +34,7 @@ WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
 
 WHISPER_MODEL = None
+
 
 
 def bootstrap():
@@ -281,6 +282,8 @@ if __name__ == "__main__":
                 if in_speech:
                     if ema_rms < VAD_SILENCE_THRESHOLD:
                         silent_blocks += 1
+                        if DEBUG_MODE:
+                            print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS} (EMA {ema_rms:.0f})")
                         if silent_blocks >= SILENCE_BLOCKS:
                             total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
                             if total_speech_s >= VAD_MIN_SPEECH_S:
