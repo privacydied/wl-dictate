@@ -38,11 +38,10 @@ WHISPER_MODEL = None
 
 
 def _probe_cuda_available():
-    """Check if CUDA is available by attempting a lightweight CTranslate2 init."""
+    """Check if CUDA devices are detected by CTranslate2."""
     try:
-        from ctranslate2 import get_cuda_runtime_version
-        get_cuda_runtime_version()
-        return True
+        from ctranslate2 import get_cuda_device_count
+        return get_cuda_device_count() > 0
     except Exception:
         return False
 
