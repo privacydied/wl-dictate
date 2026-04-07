@@ -12,17 +12,19 @@ import sounddevice as sd
 from scipy.io import wavfile
 
 # Config
-CHUNK_DURATION = 3     # seconds per recording chunk
+BLOCK_DURATION = 0.5       # seconds per recording block (small slices for silence detection)
+SILENCE_BLOCKS = 3         # consecutive silent blocks before transcribing (~1.5s pause)
 SAMPLE_RATE = 16000
 CHANNELS = 1
 WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL_NAME = "tiny.en"  # tiny.en = near-instant on CPU
 DESIRED_MODEL_PATH = f"whisper.cpp/models/ggml-{WHISPER_MODEL_NAME}.bin"
-VAD_RMS_THRESHOLD = 300  # skip whisper if RMS below this (silence)
-THREADS = 16             # Ryzen 3700X has 8C/16T
+VAD_RMS_THRESHOLD = 500     # below this counts as a silent block
+THREADS = 16                # Ryzen 3700X has 8C/16T
 WHISPER_TIMEOUT = 30
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
+MAX_BUFFER_SECONDS = 20     # safety cap — force transcribe if buffer gets too long
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WHISPER_LIB_DIR = os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "src")
@@ -221,14 +223,10 @@ def record_chunk(duration, device_id=None):
     audio *= 32767
     audio = np.clip(audio, -32768, 32767).astype(np.int16)
 
-    # Check audio level — return None if too quiet (skip whisper)
+    # Check audio level
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
     if DEBUG_MODE:
         print(f"Audio RMS: {rms:.2f}")
-    if rms < VAD_RMS_THRESHOLD:
-        if DEBUG_MODE:
-            print("Skipping silence")
-        return None
 
     return audio
 
@@ -343,6 +341,7 @@ def transcribe_and_type(audio):
 
 if __name__ == "__main__":
     bootstrap()
+
     # List devices if no arguments
     if len(sys.argv) == 1:
         print("Available input devices:")
@@ -363,10 +362,40 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             sys.exit(1)
 
+    # VAD-based accumulation loop
+    # Record 0.5s blocks, accumulate until silence triggers transcription
     try:
+        silent_blocks = 0
+        buffer = []  # accumulated int16 numpy arrays
+
         while True:
-            audio = record_chunk(CHUNK_DURATION, device_id=device_idx)
-            if audio is not None:
-                transcribe_and_type(audio)
+            block = record_chunk(BLOCK_DURATION, device_id=device_idx)
+            if block is None:
+                continue
+
+            rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
+
+            if rms >= VAD_RMS_THRESHOLD:
+                # Speech detected — accumulate
+                silent_blocks = 0
+                buffer.append(block)
+                if DEBUG_MODE:
+                    print(f"  speech (RMS {rms:.0f}) — accumulated {len(buffer)} blocks")
+            else:
+                # Silence detected
+                silent_blocks += 1
+                if DEBUG_MODE:
+                    print(f"  silence {silent_blocks}/{SILENCE_BLOCKS}")
+
+                if len(buffer) > 0 and silent_blocks >= SILENCE_BLOCKS:
+                    # Enough silence — transcribe the accumulated buffer
+                    full_audio = np.concatenate(buffer)
+                    buffer.clear()
+                    silent_blocks = 0
+                    if DEBUG_MODE:
+                        total_s = len(full_audio) / SAMPLE_RATE
+                        print(f"→ Transcribing {total_s:.1f}s of audio")
+                    transcribe_and_type(full_audio)
+
     except KeyboardInterrupt:
         pass
