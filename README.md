@@ -25,36 +25,24 @@ Voice dictation for Wayland/X11 Linux — records your mic, transcribes with Whi
 
 ```bash
 # Debian/Ubuntu
-sudo apt install -y wtype libportaudio2
+sudo apt install -y wtype libportaudio2 make
 
 # Arch
-sudo pacman -S wtype portaudio
+sudo pacman -S wtype portaudio base-devel
 
 # Fedora
-sudo dnf install wtype portaudio
+sudo dnf install wtype portaudio make
 ```
 
 - **`wtype`** — types text into the focused window (Wayland + X11)
 - **`libportaudio2` / `portaudio`** — audio backend for sounddevice
+- **`make`** / **`base-devel`** — needed for building whisper.cpp
 
-### 2. Build whisper-cli
+> **Note:** `whisper-cli` is built and the model is downloaded automatically on first run.
+> If `curl` or `wget` is installed the model download is fully automatic; otherwise download
+> `ggml-base.en.bin` manually into `whisper.cpp/models/`.
 
-```bash
-git submodule update --init --recursive
-cd whisper.cpp
-make -j$(nproc)
-```
-
-### 3. Download a Whisper model
-
-```bash
-cd whisper.cpp/models
-./download-ggml-model.sh base.en
-```
-
-This downloads `ggml-base.en.bin` (~140 MB). For better accuracy use `small.en` or `base` (multilingual). See `whisper.cpp/models/` for all available models.
-
-### 4. Python dependencies
+### 2. Python dependencies
 
 ```bash
 pip install sounddevice scipy numpy PyQt5 evdev
@@ -121,7 +109,7 @@ Edit `whisper_dictate.py` constants to tune behaviour:
 
 ## Troubleshooting
 
-**`whisper-cli not found`** — build whisper.cpp first (see step 2 above).
+**`whisper-cli not found`** — the app tries to build it automatically. If the build fails, ensure the `whisper.cpp/` submodule is present (`git submodule update --init --recursive`) and that `make` is installed.
 
 **`wtype is not installed`** — install the `wtype` system package (see step 1).
 
