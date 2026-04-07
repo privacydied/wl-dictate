@@ -136,7 +136,11 @@ def record_chunk(duration, device_id=None):
         return None
     try:
         if device_idx is None:
-            device_info = sd.query_devices(sd.default.device[0], "input")
+            default_input = sd.default.device[0]
+            if default_input is None:
+                print("No default input device set")
+                return None
+            device_info = sd.query_devices(default_input, "input")
         else:
             device_info = sd.query_devices(device_idx, "input")
     except OSError as e:
@@ -206,11 +210,9 @@ def transcribe_and_type(audio):
         return
     if DEBUG_MODE:
         print(f"Cleaned transcription: {repr(text)}")
-    # Type via wtype
+    # Type via wtype (Wayland-only; DISPLAY is irrelevant for wtype)
     try:
         wtype_env = os.environ.copy()
-        if "DISPLAY" not in wtype_env:
-            wtype_env["DISPLAY"] = ":1"
         wtype_env.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
         wtype_env.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
         subprocess.run(["wtype", " " + text], check=True, timeout=WTYPE_TIMEOUT, env=wtype_env)
