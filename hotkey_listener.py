@@ -13,7 +13,7 @@ class HotkeyListener(threading.Thread):
         self.keyboard_devices = []
         self.pressed_keys = set()
         self.hotkey_combination = {
-            evdev.ecodes.KEY_LEFTCTRL, evdev.ecodes.KEY_LEFTALT, evdev.ecodes.KEY_D
+            evdev.ecodes.KEY_LEFTCTRL, evdev.ecodes.KEY_LEFTALT, evdev.ecodes.KEY_F
         }
         self._devices_lock = threading.Lock()
 

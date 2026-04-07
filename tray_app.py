@@ -5,9 +5,11 @@ import signal
 import json
 import atexit
 import time
+import socket
 import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup, QAction
 from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QSocketNotifier
 from whisper_dictate import bootstrap
 
 class DictationTrayApp:
@@ -59,6 +61,39 @@ class DictationTrayApp:
         self.dictation_process = None
         self.is_dictating = False
         self._cleaned = False
+
+        # Unix socket listener for hotkey toggle (no root needed)
+        self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
+        self._socket = None
+        self._notifier = None
+        self._start_socket_listener()
+
+    def _start_socket_listener(self):
+        """Listen on a Unix socket so a toggle script can control dictation."""
+        try:
+            if os.path.exists(self._socket_path):
+                os.unlink(self._socket_path)
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._socket.bind(self._socket_path)
+            self._socket.listen(5)
+            self._socket.setblocking(False)
+            # QSocketNotifier fires on the main thread
+            self._notifier = QSocketNotifier(self._socket.fileno(), QSocketNotifier.Read, self.app)
+            self._notifier.activated.connect(self._socket_ready)
+        except Exception as e:
+            print(f"⚠️ Could not start socket listener: {e}")
+
+    def _socket_ready(self):
+        if not self._socket:
+            return
+        try:
+            conn, _ = self._socket.accept()
+            data = conn.recv(64).decode().strip()
+            conn.close()
+            if data == "toggle":
+                self.toggle_dictation()
+        except OSError:
+            pass
 
     def signal_handler(self, signum, frame):
         self.cleanup()
@@ -185,6 +220,18 @@ class DictationTrayApp:
         if self._cleaned:
             return
         self._cleaned = True
+        # Clean up socket
+        if self._notifier:
+            self._notifier.activated.disconnect()
+            self._notifier.setEnabled(False)
+        if self._socket:
+            self._socket.close()
+        sock_path = self._socket_path
+        if sock_path and os.path.exists(sock_path):
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
         self.stop_dictation()
         if hasattr(self, 'dictation_process') and self.dictation_process:
             self.dictation_process.terminate()
