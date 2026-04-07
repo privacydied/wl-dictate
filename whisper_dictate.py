@@ -5,6 +5,7 @@ import subprocess
 import numpy as np
 import sounddevice as sd
 import tempfile
+import shutil
 from scipy.io import wavfile
 
 # Config
@@ -13,10 +14,79 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = "whisper.cpp/models/ggml-base.en.bin"
+WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
 DEBUG_MODE = True  # Set to False in production
 THREADS = 4  # Number of threads for whisper-cli
 WHISPER_TIMEOUT = 60  # max seconds for whisper-cli to transcribe one chunk
 WTYPE_TIMEOUT = 10  # max seconds for wtype to type the text
+
+
+def _ensure_whisper_cli():
+    """Build whisper-cli from the whisper.cpp submodule if the binary is missing."""
+    if os.path.isfile(WHISPER_BINARY):
+        return
+    print("⚠️ whisper-cli not found — building from source…")
+    source_dir = os.path.dirname(WHISPER_BINARY).rsplit("/", 2)[0]  # whisper.cpp/
+    if not os.path.isdir(source_dir):
+        print(f"❌ whisper.cpp/ directory not found. Run: git submodule update --init --recursive")
+        sys.exit(1)
+    subprocess.check_call(
+        ["make", "-j" + str(max(2, os.cpu_count() or 2))],
+        cwd=source_dir,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+    if not os.path.isfile(WHISPER_BINARY):
+        print("❌ Build succeeded but whisper-cli still not found")
+        sys.exit(1)
+    print("✔️ whisper-cli built successfully")
+
+
+def _ensure_whisper_model():
+    """Download the ggml-base.en model if it's missing."""
+    if os.path.isfile(WHISPER_MODEL):
+        return
+    print(f"⚠️ Whisper model not found — downloading {WHISPER_MODEL_URL} …")
+    model_dir = os.path.dirname(WHISPER_MODEL)
+    os.makedirs(model_dir, exist_ok=True)
+
+    download_script = os.path.join(os.path.dirname(WHISPER_MODEL), "download-ggml-model.sh")
+    if os.path.isfile(download_script):
+        subprocess.check_call(
+            [download_script, "base.en"],
+            cwd=os.path.dirname(WHISPER_MODEL),
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    elif shutil.which("curl"):
+        dest = os.path.join(model_dir, os.path.basename(WHISPER_MODEL))
+        subprocess.check_call(
+            ["curl", "-#L", "-o", dest, WHISPER_MODEL_URL],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    elif shutil.which("wget"):
+        subprocess.check_call(
+            ["wget", "-O", os.path.join(model_dir, os.path.basename(WHISPER_MODEL)), WHISPER_MODEL_URL],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    else:
+        print(f"❌ No curl or wget available to download the model. Download manually from {WHISPER_MODEL_URL}")
+        sys.exit(1)
+
+    if not os.path.isfile(WHISPER_MODEL):
+        print("❌ Model download failed — file not found after download")
+        sys.exit(1)
+    print("✔️ Whisper model downloaded successfully")
+
+
+def bootstrap():
+    """Ensure whisper-cli is built and the model is present."""
+    _ensure_whisper_cli()
+    _ensure_whisper_model()
+    # Update WHISPER_MODEL constant when called from tray_app.py
+    # (the constants above are set at module level, so just verifying them is enough)
 
 def resolve_device(device_arg):
     """Resolve device argument to device index."""
@@ -220,6 +290,7 @@ def transcribe_and_type(audio):
             os.unlink(wav_path)
 
 if __name__ == "__main__":
+    bootstrap()
     # List devices if no arguments
     if len(sys.argv) == 1:
         print("Available input devices:")

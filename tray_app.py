@@ -7,6 +7,7 @@ import atexit
 import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup, QAction
 from PyQt5.QtGui import QIcon
+from whisper_dictate import bootstrap
 
 class DictationTrayApp:
     def __init__(self):
@@ -189,5 +190,6 @@ class DictationTrayApp:
         sys.exit(self.app.exec_())
 
 if __name__ == "__main__":
+    bootstrap()
     app = DictationTrayApp()
     app.run()
