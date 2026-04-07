@@ -242,13 +242,19 @@ def transcribe_and_type(audio):
 
     binary_path = os.path.join(SCRIPT_DIR, WHISPER_BINARY)
     model_path = os.path.join(SCRIPT_DIR, DESIRED_MODEL_PATH)
-    run_env = os.environ.copy()
-    run_env["LD_LIBRARY_PATH"] = WHISPER_LIB_DIR
 
+    if not os.path.isfile(binary_path):
+        print(f"whisper-cli not found at {binary_path}")
+        return
+    if not os.path.isfile(model_path):
+        print(f"Whisper model not found at {model_path}")
+        return
+
+    # Ensure Wayland env is available
     if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
 
-    # Save audio to WAV
+    wav_fd, wav_path = None, None
     try:
         wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
         os.close(wav_fd)
@@ -256,30 +262,6 @@ def transcribe_and_type(audio):
     except Exception as e:
         print(f"Failed to write WAV: {e}")
         return
-
-    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-    if DEBUG_MODE:
-        print(f"Audio RMS: {rms:.1f}")
-
-    # Skip silence to avoid wasting 2s on "(wind blowing)" for ambient noise
-    if rms < VAD_RMS_THRESHOLD:
-        if DEBUG_MODE:
-            print("Silence detected — skipping transcription")
-        return
-
-    # Save audio to WAV
-    wav_fd = None
-    wav_path = None
-    try:
-        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
-        os.close(wav_fd)
-        wavfile.write(wav_path, SAMPLE_RATE, audio)
-    except Exception as e:
-        print(f"Failed to write WAV: {e}")
-        return
-
-    if DEBUG_MODE:
-        print(f"Debug: WAV saved to {wav_path}")
 
     # Transcribe using whisper-cli
     run_env = os.environ.copy()

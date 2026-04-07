@@ -1,7 +1,6 @@
 import logging
 import os
 import subprocess
-import signal
 import sys
 import json
 import atexit
@@ -19,7 +18,7 @@ log = logging.getLogger(__name__)
 
 
 class WorkerMonitor(threading.Thread):
-    """Watches the dictation worker subprocess so a crash syncs is_dictating [T3]."""
+    """Watches the dictation worker subprocess and signals on exit."""
 
     def __init__(self, tray_app, process):
         super().__init__(daemon=True)
@@ -31,20 +30,9 @@ class WorkerMonitor(threading.Thread):
         exit_code = self.process.wait()
         if self._stop.is_set():
             return
-        # Process died while we thought it was running
         if exit_code != 0:
             log.warning("Dictation worker exited abnormally (code %d)", exit_code)
-        # Sync state from worker thread — use QMetaObject for thread safety
-        if self.tray_app.is_dictating:
-            self.tray_app.is_dictating = False
-            self.tray_app.set_icon(False)  # safe: Qt icon ops are thread-safe enough for simple state
-            try:
-                subprocess.run(
-                    ["notify-send", "Dictation Tool", "Dictation stopped unexpectedly"],
-                    timeout=3,
-                )
-            except Exception:
-                pass
+        self.tray_app._worker_event.set()
 
 
 class DictationTrayApp:
@@ -52,40 +40,45 @@ class DictationTrayApp:
         self.app = QApplication(sys.argv)
         self.tray_icon = QSystemTrayIcon()
 
-        # Register cleanup
         atexit.register(self.cleanup)
-
-        # Connect aboutToQuit
         self.app.aboutToQuit.connect(self.cleanup)
 
-        # Set up signal handlers via QTimer so they run on the Qt main thread
+        # SIGINT/SIGTERM via QTimer (avoids Qt issues with C signal handlers)
         import signal as _signal
         self._sig_flag = False
-
-        def _catch_signal(*_args):
-            self._sig_flag = True
-
-        _signal.signal(_signal.SIGINT, _catch_signal)
-        _signal.signal(_signal.SIGTERM, _catch_signal)
-
+        _signal.signal(_signal.SIGINT, lambda *_: setattr(self, "_sig_flag", True))
+        _signal.signal(_signal.SIGTERM, lambda *_: setattr(self, "_sig_flag", True))
         self._sig_timer = QTimer()
-        self._sig_timer.timeout.connect(self._check_signal)
-        self._sig_timer.start(250)  # check every 250ms
+        self._sig_timer.timeout.connect(self._check_signals)
+        self._sig_timer.start(250)
 
-        # Get script directory
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-
-        # Configuration
         self.config_path = os.path.join(self.script_dir, "config.json")
         self.load_config()
+
+        self.dictation_process = None
+        self._worker_monitor = None
+        self._worker_event = threading.Event()
+        self._log_file = None
+        self.is_dictating = False
+        self._cleaned = False
+        self._shutting_down = False
+
+        # Worker crash sync: main-thread QTimer polls the threading.Event
+        self._worker_timer = QTimer()
+        self._worker_timer.timeout.connect(self._check_worker)
+        self._worker_timer.start(500)
+
+        # Unix socket for hotkey toggle (no root needed)
+        self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
+        self._socket = None
+        self._notifier = None
+        self._start_socket_listener()
 
         self.set_icon(False)
         self.tray_icon.show()
 
-        # Create context menu
         self.menu = QMenu()
-
-        # Input device submenu
         self.device_menu = self.menu.addMenu("Input Device")
         self.reload_devices()
 
@@ -99,24 +92,9 @@ class DictationTrayApp:
         self.quit_action.triggered.connect(self.quit_app)
 
         self.tray_icon.setContextMenu(self.menu)
-
-        # Connect icon click
         self.tray_icon.activated.connect(self.on_icon_click)
 
-        self.dictation_process = None
-        self._worker_monitor = None
-        self.is_dictating = False
-        self._cleaned = False
-        self._shutting_down = False  # [T4] distinguish quit from normal stop
-
-        # Unix socket listener for hotkey toggle
-        self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
-        self._socket = None
-        self._notifier = None
-        self._start_socket_listener()
-
     def _start_socket_listener(self):
-        """Listen on a Unix socket so a toggle script can control dictation."""
         try:
             if os.path.exists(self._socket_path):
                 os.unlink(self._socket_path)
@@ -137,18 +115,28 @@ class DictationTrayApp:
             try:
                 data = conn.recv(64).decode().strip()
             finally:
-                conn.close()  # [T1] always close the connection
+                conn.close()
             if data == "toggle":
                 self.toggle_dictation()
         except OSError:
             pass
 
-    def _check_signal(self):
-        """Called by QTimer on the main thread — handles SIGINT/SIGTERM."""
+    def _check_signals(self):
         if self._sig_flag:
             self._sig_flag = False
             self.cleanup()
             self.app.quit()
+
+    def _check_worker(self):
+        if self._worker_event.is_set():
+            self._worker_event.clear()
+            if self.is_dictating:
+                self.is_dictating = False
+                self.set_icon(False)
+                try:
+                    subprocess.run(["notify-send", "Dictation Tool", "Dictation stopped unexpectedly"], timeout=3)
+                except Exception:
+                    pass
 
     def on_icon_click(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -159,20 +147,16 @@ class DictationTrayApp:
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r") as f:
-                    config = json.load(f)
-                    self.input_device = config.get("input_device")
+                    self.input_device = json.load(f).get("input_device")
             except (json.JSONDecodeError, OSError, ValueError, TypeError):
                 pass
 
     def save_config(self):
-        config = {"input_device": self.input_device}
         with open(self.config_path, "w") as f:
-            json.dump(config, f)
+            json.dump({"input_device": self.input_device}, f)
 
     def reload_devices(self):
-        """Reload available input devices."""
         self.device_menu.clear()
-
         try:
             devices = sd.query_devices()
         except OSError:
@@ -180,28 +164,26 @@ class DictationTrayApp:
             no_devices.setEnabled(False)
             return
 
-        input_devices = []
-        for idx, device in enumerate(devices):
-            if device["max_input_channels"] > 0:
-                input_devices.append((idx, device))
-
+        input_devices = [
+            (idx, dev) for idx, dev in enumerate(devices)
+            if dev["max_input_channels"] > 0
+        ]
         if not input_devices:
             no_devices = self.device_menu.addAction("No input devices found")
             no_devices.setEnabled(False)
             return
 
-        # Replace previous group to avoid orphaned QActionGroup objects [T5]
         if hasattr(self, "_device_group") and self._device_group:
             self._device_group.deleteLater()
-        self.device_group = QActionGroup(self.device_menu)
-        for idx, device in input_devices:
-            device_name = device["name"]
-            sample_rate = int(device["default_samplerate"])
-            action = self.device_menu.addAction(f"{idx}: {device_name} ({sample_rate} Hz)")
+        self._device_group = QActionGroup(self.device_menu)
+        for idx, dev in input_devices:
+            action = self.device_menu.addAction(
+                f"{idx}: {dev['name']} ({int(dev['default_samplerate'])} Hz)"
+            )
             action.setCheckable(True)
             action.setChecked(idx == self.input_device)
-            self.device_group.addAction(action)
-            action.triggered.connect(lambda checked, idx=idx: self.set_input_device(idx))
+            self._device_group.addAction(action)
+            action.triggered.connect(lambda _, i=idx: self.set_input_device(i))
 
         self.device_menu.addSeparator()
         reload_action = self.device_menu.addAction("Reload Devices")
@@ -211,35 +193,21 @@ class DictationTrayApp:
         self.input_device = device_idx
         self.save_config()
         self.set_icon(self.is_dictating)
-
         try:
-            device_info = sd.query_devices(device_idx, "input")
-            device_name = device_info.get("name", f"device {device_idx}")  # [T7]
-            subprocess.run(["notify-send", "Dictation Tool", f"Input device set to: {device_name}"])
+            name = sd.query_devices(device_idx, "input").get("name", f"device {device_idx}")
+            subprocess.run(["notify-send", "Dictation Tool", f"Input device set to: {name}"])
         except OSError:
             subprocess.run(["notify-send", "Dictation Tool", f"Input device set to index {device_idx}"])
 
     def set_icon(self, active):
-        icon_name = "mic-on.png" if active else "mic-off.png"
-        icon_path = os.path.join(self.script_dir, icon_name)
+        icon_path = os.path.join(self.script_dir, "mic-on.png" if active else "mic-off.png")
         self.tray_icon.setIcon(QIcon(icon_path))
-
         status = "ON" if active else "OFF"
         device_info = f" ({self.input_device})" if self.input_device is not None else ""
         self.tray_icon.setToolTip(f"Dictation: {status}{device_info}")
 
     def toggle_dictation(self):
-        if self.is_dictating:
-            self.stop_dictation()
-        else:
-            self.start_dictation()
-
-    def _open_log_file(self):
-        """Open a rotating log file for worker output [T6]."""
-        log_path = os.path.join(self.script_dir, "dictation.log")
-        handler = RotatingFileHandler(log_path, maxBytes=512 * 1024, backupCount=3)
-        handler.stream = handler._open()
-        return handler.stream
+        self.stop_dictation() if self.is_dictating else self.start_dictation()
 
     def start_dictation(self):
         if self.is_dictating:
@@ -249,67 +217,33 @@ class DictationTrayApp:
             cmd = [sys.executable, worker_script]
             if self.input_device is not None:
                 cmd.append(str(self.input_device))
+
             env = os.environ.copy()
             for var in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP"):
                 if not os.environ.get(var):
                     env.pop(var, None)
 
-            log_f = self._open_log_file()
-            log_f.write(f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            log_f.flush()
+            self._log_file = self._open_log_file()
+            self._log_file.write(f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            self._log_file.flush()
 
-            self.dictation_process = subprocess.Popen(
-                cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT
-            )
+            self._worker_event.clear()
+            self.dictation_process = subprocess.Popen(cmd, env=env, stdout=self._log_file, stderr=subprocess.STDOUT)
             self.is_dictating = True
             self.set_icon(True)
             subprocess.run(["notify-send", "Dictation Tool", "Dictation started"])
 
-            # Start monitoring thread [T3]
             self._worker_monitor = WorkerMonitor(self, self.dictation_process)
             self._worker_monitor.start()
         except Exception as e:
             subprocess.run(["notify-send", "Dictation Tool Error", f"Failed to start: {str(e)}"])
 
     def stop_dictation(self, during_cleanup=False):
-        if self.is_dictating:
-            if self.dictation_process:
-                self.dictation_process.terminate()
-                try:
-                    self.dictation_process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self.dictation_process.kill()
-                    self.dictation_process.wait(timeout=2.0)
-                self.dictation_process = None
-            self.is_dictating = False
-            self.set_icon(False)
-            # [T2] avoid calling stop_dictation recursively from cleanup
-            if not during_cleanup and not self._shutting_down:
-                subprocess.run(["notify-send", "Dictation Tool", "Dictation stopped"])
-
-    def cleanup(self):
-        if self._cleaned:
+        if not self.is_dictating:
             return
-        self._cleaned = True
-        self._shutting_down = True
+        self.is_dictating = False
+        self._worker_event.clear()
 
-        # Clean up socket
-        if self._notifier:
-            self._notifier.activated.disconnect()
-            self._notifier.setEnabled(False)
-        if self._socket:
-            self._socket.close()
-        sock_path = self._socket_path
-        if sock_path and os.path.exists(sock_path):
-            try:
-                os.unlink(sock_path)
-            except OSError:
-                pass
-
-        # Stop worker once — don't call stop_dictation which is no-op-safe [T2]
-        if self._worker_monitor:
-            self._worker_monitor._stop.set()
-            self._worker_monitor = None
         if self.dictation_process:
             self.dictation_process.terminate()
             try:
@@ -318,8 +252,52 @@ class DictationTrayApp:
                 self.dictation_process.kill()
                 self.dictation_process.wait(timeout=2.0)
             self.dictation_process = None
-        self.is_dictating = False
+
+        if self._worker_monitor:
+            self._worker_monitor._stop.set()
+            self._worker_monitor = None
+
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
         self.set_icon(False)
+        if not during_cleanup and not self._shutting_down:
+            try:
+                subprocess.run(["notify-send", "Dictation Tool", "Dictation stopped"], timeout=3)
+            except Exception:
+                pass
+
+    def _open_log_file(self):
+        log_path = os.path.join(self.script_dir, "dictation.log")
+        handler = RotatingFileHandler(log_path, maxBytes=512 * 1024, backupCount=3)
+        handler.stream = handler._open()
+        return handler.stream
+
+    def cleanup(self):
+        if self._cleaned:
+            return
+        self._cleaned = True
+        self._shutting_down = True
+        self._sig_timer.stop()
+        self._worker_timer.stop()
+        if self._notifier:
+            try:
+                self._notifier.activated.disconnect()
+            except Exception:
+                pass
+            self._notifier.setEnabled(False)
+        if self._socket:
+            self._socket.close()
+        if self._socket_path and os.path.exists(self._socket_path):
+            try:
+                os.unlink(self._socket_path)
+            except OSError:
+                pass
+        self.stop_dictation(during_cleanup=True)
 
     def quit_app(self):
         self.cleanup()
