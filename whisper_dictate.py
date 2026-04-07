@@ -16,11 +16,16 @@ FASTER_WHISPER_DEVICE = "cpu"
 FASTER_WHISPER_COMPUTE_TYPE = "int8"
 BLOCK_DURATION = 0.5
 SILENCE_BLOCKS = 2
-MAX_SPEECH_BLOCKS = 160
+MAX_SPEECH_BLOCKS = 30
 TRANSCRIBE_CHUNK_SIZE = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
-VAD_RMS_THRESHOLD = 500
+VAD_RMS_THRESHOLD = 500         # kept for reference
+VAD_EMA_ALPHA = 0.3             # EMA smoothing factor
+VAD_SPEECH_THRESHOLD = 600      # above this = speech begins
+VAD_SILENCE_THRESHOLD = 350     # below this = speech ends
+VAD_MIN_SPEECH_S = 0.3          # minimum speech duration to transcribe
+SILENCE_DEBLOCK_BLOCKS = 2      # extra silence after transcription before re-arming
 WHISPER_TIMEOUT = 30
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
@@ -232,6 +237,10 @@ if __name__ == "__main__":
 
     silent_blocks = 0
     speech_chunks = []
+    ema_rms = 0.0
+    in_speech = False
+    silence_debounce = 0
+    energy_floor = float('inf')
     print("🎙️ Listening... (Ctrl+C to stop)")
     audio_queue = queue.Queue()
 
@@ -262,25 +271,52 @@ if __name__ == "__main__":
                         )
                 block = (np.clip(block, -1, 1) * 32767).astype(np.int16)
                 rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
-                if rms >= VAD_RMS_THRESHOLD:
-                    silent_blocks = 0
-                    speech_chunks.append(block)
-                    total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
-                    if DEBUG_MODE:
-                        print(f"  🗣 speech (RMS {rms:.0f}) +{len(block) / SAMPLE_RATE:.1f}s")
-                    if total_speech_s >= BLOCK_DURATION * MAX_SPEECH_BLOCKS:
-                        to_transcribe = list(speech_chunks)
-                        speech_chunks.clear()
-                        _enqueue_transcribe(to_transcribe, "forced")
-                else:
-                    silent_blocks += 1
-                    if DEBUG_MODE:
-                        print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
-                    if len(speech_chunks) > 0 and silent_blocks >= SILENCE_BLOCKS:
-                        to_transcribe = list(speech_chunks)
-                        speech_chunks.clear()
+                # EMA energy smoothing & energy floor tracking
+                ema_rms = VAD_EMA_ALPHA * rms + (1 - VAD_EMA_ALPHA) * ema_rms
+                if not in_speech and ema_rms < energy_floor:
+                    energy_floor = ema_rms
+                if in_speech:
+                    if ema_rms < VAD_SILENCE_THRESHOLD:
+                        silent_blocks += 1
+                        if silent_blocks >= SILENCE_BLOCKS:
+                            total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
+                            if total_speech_s >= VAD_MIN_SPEECH_S:
+                                to_transcribe = list(speech_chunks)
+                                speech_chunks.clear()
+                                silent_blocks = 0
+                                silence_debounce = SILENCE_DEBLOCK_BLOCKS
+                                in_speech = False
+                                _enqueue_transcribe(to_transcribe, "silence")
+                            else:
+                                speech_chunks.clear()
+                                silent_blocks = 0
+                                in_speech = False
+                        if DEBUG_MODE:
+                            print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
+                    else:
                         silent_blocks = 0
-                        _enqueue_transcribe(to_transcribe, "silence")
+                        speech_chunks.append(block)
+                        if DEBUG_MODE:
+                            print(f"  🗣 speech (EMA {ema_rms:.0f}) +{len(block) / SAMPLE_RATE:.1f}s")
+                else:
+                    if ema_rms >= VAD_SPEECH_THRESHOLD:
+                        if silence_debounce > 0:
+                            silence_debounce -= 1
+                        else:
+                            in_speech = True
+                            speech_chunks.append(block)
+                            silent_blocks = 0
+                            if DEBUG_MODE:
+                                print(f"  🗣 {ema_rms:.0f} onset")
+                # Runaway guard (MAX_SPEECH_BLOCKS = 30 blocks = ~15s)
+                total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
+                if total_speech_s >= BLOCK_DURATION * MAX_SPEECH_BLOCKS:
+                    to_transcribe = list(speech_chunks)
+                    speech_chunks.clear()
+                    in_speech = False
+                    _enqueue_transcribe(to_transcribe, "forced")
+                    if DEBUG_MODE:
+                        print(f"  ⚠️ forced flush ({total_speech_s:.1f}s)")
         except KeyboardInterrupt:
             print("\n🛑 Stopping...")
             if speech_chunks:
