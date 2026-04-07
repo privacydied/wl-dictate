@@ -79,7 +79,10 @@ class HotkeyListener(threading.Thread):
                                     elif event.value == 0:  # Key up
                                         self.pressed_keys.discard(scancode)
                                         # Check hotkey on release of the trigger key [H1]
-                                        if self.pressed_keys <= all_modifiers and scancode == evdev.ecodes.KEY_D:
+                                        if (
+                                            self.pressed_keys <= all_modifiers
+                                            and scancode == evdev.ecodes.KEY_D
+                                        ):
                                             self.callback()
                     except (OSError, IOError):
                         with self._devices_lock:

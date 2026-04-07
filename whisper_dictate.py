@@ -25,20 +25,20 @@ FASTER_WHISPER_DEVICE = "cuda"
 FASTER_WHISPER_COMPUTE_TYPE = "float16"
 
 # Transcription quality / performance
-TRANSCRIBE_BEAM_SIZE = 2            # tiny.en gains nothing from beam>2
-TRANSCRIBE_VAD_FILTER = True        # built-in Silero VAD trims silence from audio
+TRANSCRIBE_BEAM_SIZE = 2  # tiny.en gains nothing from beam>2
+TRANSCRIBE_VAD_FILTER = True  # built-in Silero VAD trims silence from audio
 
-BLOCK_DURATION = 0.5                # seconds per VAD evaluation block
-SILENCE_BLOCKS = 2                  # consecutive quiet blocks to flush
-MAX_SPEECH_BLOCKS = 30              # forced flush after ~15s
+BLOCK_DURATION = 0.5  # seconds per VAD evaluation block
+SILENCE_BLOCKS = 2  # consecutive quiet blocks to flush
+MAX_SPEECH_BLOCKS = 30  # forced flush after ~15s
 SAMPLE_RATE = 16000
 
-VAD_EMA_ALPHA = 0.3                 # EMA smoothing factor
-VAD_SPEECH_THRESHOLD = 200          # above this = speech begins
-VAD_SILENCE_THRESHOLD = 100         # floor for relative silence detection
-VAD_MIN_SPEECH_S = 0.3              # minimum speech duration to transcribe
-VAD_SILENCE_RATIO = 0.25            # silence when EMA drops below 25% of peak
-SILENCE_DEBLOCK_BLOCKS = 2          # hysteresis after flushing
+VAD_EMA_ALPHA = 0.3  # EMA smoothing factor
+VAD_SPEECH_THRESHOLD = 200  # above this = speech begins
+VAD_SILENCE_THRESHOLD = 100  # floor for relative silence detection
+VAD_MIN_SPEECH_S = 0.3  # minimum speech duration to transcribe
+VAD_SILENCE_RATIO = 0.25  # silence when EMA drops below 25% of peak
+SILENCE_DEBLOCK_BLOCKS = 2  # hysteresis after flushing
 
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
@@ -61,10 +61,12 @@ _WTYPE_CMD: list[str] = []
 
 # ── Bootstrap ───────────────────────────────────────────────────────────────
 
+
 def _probe_cuda_available() -> bool:
     """Check if CUDA devices are detected by CTranslate2."""
     try:
         from ctranslate2 import get_cuda_device_count  # pyright: ignore[reportMissingImports]
+
         return get_cuda_device_count() > 0
     except Exception:
         return False
@@ -82,10 +84,14 @@ def bootstrap() -> None:
         device = "cpu"
         compute_type = "int8"
 
-    print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({device}/{compute_type})...")
+    print(
+        f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({device}/{compute_type})..."
+    )
     try:
         WHISPER_MODEL = WhisperModel(
-            FASTER_WHISPER_MODEL, device=device, compute_type=compute_type,
+            FASTER_WHISPER_MODEL,
+            device=device,
+            compute_type=compute_type,
         )
         print("Model loaded successfully")
     except Exception as e:
@@ -93,7 +99,9 @@ def bootstrap() -> None:
             raise
         print(f"WARNING: Failed to load with {device}, falling back to CPU: {e}")
         WHISPER_MODEL = WhisperModel(
-            FASTER_WHISPER_MODEL, device="cpu", compute_type="int8",
+            FASTER_WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
         )
         print("Model loaded successfully (CPU fallback)")
 
@@ -105,6 +113,7 @@ def bootstrap() -> None:
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────
+
 
 def resolve_device(device_arg: str | None) -> int | None:
     """Resolve device argument to an integer device index."""
@@ -153,6 +162,7 @@ def _guess_wayland_display() -> bool:
 
 # ── Transcription ───────────────────────────────────────────────────────────
 
+
 def transcribe_and_type(audio: np.ndarray) -> None:
     """Transcribe audio and type the result via wtype."""
     if WHISPER_MODEL is None:
@@ -168,7 +178,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
             beam_size=TRANSCRIBE_BEAM_SIZE,
             vad_filter=TRANSCRIBE_VAD_FILTER,
             language="en",
-            condition_on_previous_text=False,   # avoid hallucination loops
+            condition_on_previous_text=False,  # avoid hallucination loops
             initial_prompt="Transcribe verbatim.",  # prime the decoder
         )
         text = " ".join(seg.text for seg in segments).strip()
@@ -257,15 +267,23 @@ def main(device_arg: str | None = None) -> None:
     device_idx = resolve_device(device_arg) if device_arg else None
 
     with sd.InputStream(
-        samplerate=None, channels=1, dtype="float32",
-        device=device_idx, callback=_audio_callback,
+        samplerate=None,
+        channels=1,
+        dtype="float32",
+        device=device_idx,
+        callback=_audio_callback,
         blocksize=BLOCK_SAMPLES,
     ):
         if device_idx is not None:
-            input_sr = int(sd.query_devices(device_idx, "input")["default_samplerate"])
-            if input_sr <= 0:
-                print(f"WARNING: Device {device_idx} reports invalid samplerate {input_sr}, using default {SAMPLE_RATE}")
+            dev_info = sd.query_devices(device_idx, "input")
+            raw_sr = dev_info.get("default_samplerate")
+            if raw_sr is None or raw_sr <= 0:
+                print(
+                    f"WARNING: Device {device_idx} reports invalid samplerate {raw_sr}, using default {SAMPLE_RATE}"
+                )
                 input_sr = SAMPLE_RATE
+            else:
+                input_sr = int(raw_sr)
         else:
             input_sr = SAMPLE_RATE
 
@@ -290,7 +308,8 @@ def main(device_arg: str | None = None) -> None:
                     if target_len > 0:
                         block = np.interp(
                             np.linspace(0, len(block), target_len, endpoint=False),
-                            np.arange(len(block)), block,
+                            np.arange(len(block)),
+                            block,
                         )
 
                 # Scale to int16 range for VAD thresholds
