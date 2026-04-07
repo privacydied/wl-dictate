@@ -10,9 +10,6 @@ import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QSocketNotifier, QTimer
-from whisper_dictate import bootstrap
-
-
 class WorkerMonitor(threading.Thread):
     """Watches the dictation worker subprocess and signals on exit."""
 
@@ -381,6 +378,5 @@ class DictationTrayApp:
 
 
 if __name__ == "__main__":
-    bootstrap()
     app = DictationTrayApp()
     app.run()
