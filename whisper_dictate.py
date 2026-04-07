@@ -27,7 +27,6 @@ FASTER_WHISPER_COMPUTE_TYPE = "float16"
 
 # Transcription quality / performance
 TRANSCRIBE_BEAM_SIZE = 2            # tiny.en gains nothing from beam>2
-TRANSCRIBE_BATCH_SIZE = 8           # parallel segment processing in CTranslate2
 TRANSCRIBE_VAD_FILTER = True        # built-in Silero VAD trims silence from audio
 
 BLOCK_DURATION = 0.5                # seconds per VAD evaluation block
@@ -157,6 +156,7 @@ def _guess_wayland_display() -> bool:
 def transcribe_and_type(audio: np.ndarray) -> None:
     """Transcribe audio and type the result via wtype."""
     if WHISPER_MODEL is None:
+        print("WARNING: Whisper model not loaded, skipping transcription")
         return
     if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
@@ -166,11 +166,10 @@ def transcribe_and_type(audio: np.ndarray) -> None:
         segments, _ = WHISPER_MODEL.transcribe(
             audio_f32,
             beam_size=TRANSCRIBE_BEAM_SIZE,
-            batch_size=TRANSCRIBE_BATCH_SIZE,
             vad_filter=TRANSCRIBE_VAD_FILTER,
             language="en",
             condition_on_previous_text=False,   # avoid hallucination loops
-            prompt="Transcribe verbatim.",       # prime the decoder
+            initial_prompt="Transcribe verbatim.",  # prime the decoder
         )
     except RuntimeError as e:
         if "libcublas" in str(e) or "CUDA" in str(e):
@@ -265,6 +264,9 @@ def main(device_arg: str | None = None) -> None:
     ):
         if device_idx is not None:
             input_sr = int(sd.query_devices(device_idx, "input")["default_samplerate"])
+            if input_sr <= 0:
+                print(f"WARNING: Device {device_idx} reports invalid samplerate {input_sr}, using default {SAMPLE_RATE}")
+                input_sr = SAMPLE_RATE
         else:
             input_sr = SAMPLE_RATE
 
