@@ -12,20 +12,19 @@ import sounddevice as sd
 from scipy.io import wavfile
 
 # Config
-BLOCK_DURATION = 0.5       # seconds per recording block (small slices for silence detection)
-SILENCE_BLOCKS = 3         # consecutive silent blocks before transcribing (~1.5s pause)
+BLOCK_DURATION = 0.3       # seconds per recording block
+SILENCE_BLOCKS = 2         # blocks of silence to trigger transcribe (~0.6s pause)
+MAX_SPEECH_BLOCKS = 7      # force transcribe after ~2.1s of speech even without silence
 SAMPLE_RATE = 16000
 CHANNELS = 1
 WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL_NAME = "tiny.en"  # tiny.en = near-instant on CPU
 DESIRED_MODEL_PATH = f"whisper.cpp/models/ggml-{WHISPER_MODEL_NAME}.bin"
-VAD_RMS_THRESHOLD = 500     # below this counts as a silent block
+VAD_RMS_THRESHOLD = 500     # below this = silent block
 THREADS = 16                # Ryzen 3700X has 8C/16T
 WHISPER_TIMEOUT = 30
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
-MAX_BUFFER_SECONDS = 20     # safety cap — force transcribe if buffer gets too long
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WHISPER_LIB_DIR = os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "src")
 WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
@@ -362,11 +361,14 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             sys.exit(1)
 
-    # VAD-based accumulation loop
-    # Record 0.5s blocks, accumulate until silence triggers transcription
+    # VAD-based streaming loop
+    # - Accumulate 0.3s blocks
+    # - Transcribe after 0.6s silence (~2 blocks)
+    # - Also force-transcribe every ~2.1s of speech so text appears during long speech
     try:
         silent_blocks = 0
-        buffer = []  # accumulated int16 numpy arrays
+        speech_blocks = 0
+        buffer = []
 
         while True:
             block = record_chunk(BLOCK_DURATION, device_id=device_idx)
@@ -376,26 +378,44 @@ if __name__ == "__main__":
             rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
 
             if rms >= VAD_RMS_THRESHOLD:
-                # Speech detected — accumulate
+                # Speech — accumulate
                 silent_blocks = 0
+                speech_blocks += 1
                 buffer.append(block)
                 if DEBUG_MODE:
-                    print(f"  speech (RMS {rms:.0f}) — accumulated {len(buffer)} blocks")
+                    secs = speech_blocks * BLOCK_DURATION
+                    print(f"  🗣 speech (RMS {rms:.0f}) — {secs:.1f}s accumulated")
+
+                # Force transcribe if we've accumulated enough speech
+                if speech_blocks >= MAX_SPEECH_BLOCKS:
+                    full_audio = np.concatenate(buffer)
+                    buffer.clear()
+                    speech_blocks = 0
+                    if DEBUG_MODE:
+                        print(f"⚡ Force transcribe {len(full_audio) / SAMPLE_RATE:.1f}s")
+                    transcribe_and_type(full_audio)
             else:
-                # Silence detected
+                # Silence — increment counter
                 silent_blocks += 1
                 if DEBUG_MODE:
-                    print(f"  silence {silent_blocks}/{SILENCE_BLOCKS}")
+                    print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
 
                 if len(buffer) > 0 and silent_blocks >= SILENCE_BLOCKS:
                     # Enough silence — transcribe the accumulated buffer
                     full_audio = np.concatenate(buffer)
                     buffer.clear()
                     silent_blocks = 0
+                    speech_blocks = 0
                     if DEBUG_MODE:
                         total_s = len(full_audio) / SAMPLE_RATE
                         print(f"→ Transcribing {total_s:.1f}s of audio")
                     transcribe_and_type(full_audio)
 
     except KeyboardInterrupt:
+        # Flush remaining buffer on exit
+        if buffer:
+            full_audio = np.concatenate(buffer)
+            if DEBUG_MODE:
+                print(f"Final flush: {len(full_audio) / SAMPLE_RATE:.1f}s")
+            transcribe_and_type(full_audio)
         pass
