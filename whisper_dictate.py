@@ -7,7 +7,6 @@ import time
 
 import numpy as np
 import sounddevice as sd
-from scipy.io import wavfile
 from faster_whisper import WhisperModel
 
 # Config

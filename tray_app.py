@@ -31,7 +31,6 @@ class WorkerMonitor(threading.Thread):
         if self._stop.is_set():
             return
         # exit_code < 0 means killed by signal (e.g. -15 = SIGTERM from terminate())
-        # This is expected when stopping dictation normally
         if exit_code != 0 and exit_code != -15:
             log.warning("Dictation worker exited abnormally (code %d)", exit_code)
         self.tray_app._worker_event.set()
@@ -45,7 +44,6 @@ class DictationTrayApp:
         atexit.register(self.cleanup)
         self.app.aboutToQuit.connect(self.cleanup)
 
-        # SIGINT/SIGTERM via QTimer (avoids Qt issues with C signal handlers)
         import signal as _signal
         self._sig_flag = False
         _signal.signal(_signal.SIGINT, lambda *_: setattr(self, "_sig_flag", True))
@@ -63,15 +61,14 @@ class DictationTrayApp:
         self._worker_event = threading.Event()
         self._log_file = None
         self.is_dictating = False
+        self._intentional_stop = False
         self._cleaned = False
         self._shutting_down = False
 
-        # Worker crash sync: main-thread QTimer polls the threading.Event
         self._worker_timer = QTimer()
         self._worker_timer.timeout.connect(self._check_worker)
         self._worker_timer.start(500)
 
-        # Unix socket for hotkey toggle (no root needed)
         self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
         self._socket = None
         self._notifier = None
@@ -86,10 +83,8 @@ class DictationTrayApp:
 
         self.toggle_action = self.menu.addAction("Toggle Dictation")
         self.toggle_action.triggered.connect(self.toggle_dictation)
-
         self.reload_action = self.menu.addAction("Reload Devices")
         self.reload_action.triggered.connect(self.reload_devices)
-
         self.quit_action = self.menu.addAction("Quit")
         self.quit_action.triggered.connect(self.quit_app)
 
@@ -132,6 +127,9 @@ class DictationTrayApp:
     def _check_worker(self):
         if self._worker_event.is_set():
             self._worker_event.clear()
+            if self._intentional_stop:
+                self._intentional_stop = False
+                return
             if self.is_dictating:
                 self.is_dictating = False
                 self.set_icon(False)
@@ -165,7 +163,6 @@ class DictationTrayApp:
             no_devices = self.device_menu.addAction("No audio devices available")
             no_devices.setEnabled(False)
             return
-
         input_devices = [
             (idx, dev) for idx, dev in enumerate(devices)
             if dev["max_input_channels"] > 0
@@ -174,7 +171,6 @@ class DictationTrayApp:
             no_devices = self.device_menu.addAction("No input devices found")
             no_devices.setEnabled(False)
             return
-
         if hasattr(self, "_device_group") and self._device_group:
             self._device_group.deleteLater()
         self._device_group = QActionGroup(self.device_menu)
@@ -186,7 +182,6 @@ class DictationTrayApp:
             action.setChecked(idx == self.input_device)
             self._device_group.addAction(action)
             action.triggered.connect(lambda _, i=idx: self.set_input_device(i))
-
         self.device_menu.addSeparator()
         reload_action = self.device_menu.addAction("Reload Devices")
         reload_action.triggered.connect(self.reload_devices)
@@ -219,22 +214,18 @@ class DictationTrayApp:
             cmd = [sys.executable, worker_script]
             if self.input_device is not None:
                 cmd.append(str(self.input_device))
-
             env = os.environ.copy()
             for var in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP"):
                 if not os.environ.get(var):
                     env.pop(var, None)
-
             self._log_file = self._open_log_file()
             self._log_file.write(f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self._log_file.flush()
-
             self._worker_event.clear()
             self.dictation_process = subprocess.Popen(cmd, env=env, stdout=self._log_file, stderr=subprocess.STDOUT)
             self.is_dictating = True
             self.set_icon(True)
             subprocess.run(["notify-send", "Dictation Tool", "Dictation started"])
-
             self._worker_monitor = WorkerMonitor(self, self.dictation_process)
             self._worker_monitor.start()
         except Exception as e:
@@ -243,8 +234,9 @@ class DictationTrayApp:
     def stop_dictation(self, during_cleanup=False):
         if not self.is_dictating:
             return
+        self.is_dictating = False
+        self._intentional_stop = True
         self._worker_event.clear()
-
         if self.dictation_process:
             self.dictation_process.terminate()
             try:
@@ -253,18 +245,15 @@ class DictationTrayApp:
                 self.dictation_process.kill()
                 self.dictation_process.wait(timeout=2.0)
             self.dictation_process = None
-
         if self._worker_monitor:
             self._worker_monitor._stop.set()
             self._worker_monitor = None
-
         if self._log_file:
             try:
                 self._log_file.close()
             except Exception:
                 pass
             self._log_file = None
-
         self.set_icon(False)
         if not during_cleanup and not self._shutting_down:
             try:
