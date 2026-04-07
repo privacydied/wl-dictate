@@ -28,6 +28,7 @@ VAD_EMA_ALPHA = 0.3             # EMA smoothing factor
 VAD_SPEECH_THRESHOLD = 200      # above this = speech begins
 VAD_SILENCE_THRESHOLD = 100     # below this = speech ends
 VAD_MIN_SPEECH_S = 0.3          # minimum speech duration to transcribe
+VAD_SILENCE_RATIO = 0.25        # silence when EMA drops below 25% of speech peak
 SILENCE_DEBLOCK_BLOCKS = 2      # extra silence after transcription before re-arming
 WHISPER_TIMEOUT = 30
 WTYPE_TIMEOUT = 10
@@ -200,11 +201,11 @@ def transcribe_and_type(audio):
     if not text:
         print("Nothing recognized.")
         return
-    # Strip non-speech annotations and collapse whitespace
+    # Strip non-speech annotations
     text = re.sub(r"\([^)]*\)\s*", "", text)
     text = re.sub(r"\[[^\]]*\]\s*", "", text)
-    # Collapse dotted noise: "word . . . word" → "word ..."
-    text = re.sub(r"(?<=\w)\s+(?:\.\s+){2,}", " ...", text)
+    # Collapse spaced-out dots:  '. . . . . . . ' → '...'
+    text = re.sub(r"(?:\s*\.\s*){3,}", " ... ", text)
     text = re.sub(r"\s{2,}", " ", text).strip()
     if not text:
         print("Nothing recognized after cleanup.")
@@ -318,28 +319,34 @@ if __name__ == "__main__":
                 if not in_speech and ema_rms < energy_floor:
                     energy_floor = ema_rms
                 if in_speech:
-                    if ema_rms < VAD_SILENCE_THRESHOLD:
+                    # Track peak during speech for relative silence detection
+                    if ema_rms > speech_peak_rms:
+                        speech_peak_rms = ema_rms
+                    effective_silence = max(VAD_SILENCE_THRESHOLD, speech_peak_rms * VAD_SILENCE_RATIO)
+                    if ema_rms < effective_silence:
                         silent_blocks += 1
                         if DEBUG_MODE:
-                            print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS} (EMA {ema_rms:.0f})")
+                            print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS} (EMA {ema_rms:.0f}, peak {speech_peak_rms:.0f}, thr {effective_silence:.0f})")
                         if silent_blocks >= SILENCE_BLOCKS:
                             total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
                             if total_speech_s >= VAD_MIN_SPEECH_S:
                                 to_transcribe = list(speech_chunks)
                                 speech_chunks.clear()
                                 silent_blocks = 0
+                                speech_peak_rms = 0.0
                                 silence_debounce = SILENCE_DEBLOCK_BLOCKS
                                 in_speech = False
                                 _enqueue_transcribe(to_transcribe, "silence")
                             else:
                                 speech_chunks.clear()
                                 silent_blocks = 0
+                                speech_peak_rms = 0.0
                                 in_speech = False
                     else:
                         silent_blocks = 0
                         speech_chunks.append(block)
                         if DEBUG_MODE:
-                            print(f"  🗣 speech (EMA {ema_rms:.0f}) +{len(block) / SAMPLE_RATE:.1f}s")
+                            print(f"  🗣 speech (EMA {ema_rms:.0f}, peak {speech_peak_rms:.0f}) +{len(block) / SAMPLE_RATE:.1f}s")
                 else:
                     if ema_rms >= VAD_SPEECH_THRESHOLD:
                         if silence_debounce > 0:
