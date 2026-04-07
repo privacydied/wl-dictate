@@ -25,8 +25,8 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_RMS_THRESHOLD = 500         # legacy, kept for reference
 VAD_EMA_ALPHA = 0.3             # EMA smoothing factor
-VAD_SPEECH_THRESHOLD = 200      # above this = speech begins (calibrated per-mic)
-VAD_SILENCE_THRESHOLD = 100     # below this = speech ends
+VAD_SPEECH_THRESHOLD = 600      # above this = speech begins
+VAD_SILENCE_THRESHOLD = 350     # below this = speech ends
 VAD_MIN_SPEECH_S = 0.3          # minimum speech duration to transcribe
 SILENCE_DEBLOCK_BLOCKS = 2      # extra silence after transcription before re-arming
 WHISPER_TIMEOUT = 30
