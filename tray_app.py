@@ -134,7 +134,7 @@ class DictationTrayApp:
                 self.is_dictating = False
                 self.set_icon(False)
                 try:
-                    subprocess.run(["notify-send", "Dictation Tool", "Dictation stopped unexpectedly"], timeout=3)
+                    subprocess.run(["notify-send", "-t", "3000", "Dictation Tool", "Dictation stopped unexpectedly"], timeout=3)
                 except Exception:
                     pass
 
@@ -192,9 +192,9 @@ class DictationTrayApp:
         self.set_icon(self.is_dictating)
         try:
             name = sd.query_devices(device_idx, "input").get("name", f"device {device_idx}")
-            subprocess.run(["notify-send", "Dictation Tool", f"Input device set to: {name}"])
+            subprocess.run(["notify-send", "-t", "3000", "Dictation Tool", f"Input device set to: {name}"], timeout=3)
         except OSError:
-            subprocess.run(["notify-send", "Dictation Tool", f"Input device set to index {device_idx}"])
+            subprocess.run(["notify-send", "-t", "3000", "Dictation Tool", f"Input device set to index {device_idx}"], timeout=3)
 
     def set_icon(self, active):
         icon_path = os.path.join(self.script_dir, "mic-on.png" if active else "mic-off.png")
@@ -225,11 +225,11 @@ class DictationTrayApp:
             self.dictation_process = subprocess.Popen(cmd, env=env, stdout=self._log_file, stderr=subprocess.STDOUT)
             self.is_dictating = True
             self.set_icon(True)
-            subprocess.run(["notify-send", "Dictation Tool", "Dictation started"])
+            subprocess.run(["notify-send", "-t", "3000", "Dictation Tool", "Dictation started"], timeout=3)
             self._worker_monitor = WorkerMonitor(self, self.dictation_process)
             self._worker_monitor.start()
         except Exception as e:
-            subprocess.run(["notify-send", "Dictation Tool Error", f"Failed to start: {str(e)}"])
+            subprocess.run(["notify-send", "-t", "5000", "Dictation Tool Error", f"Failed to start: {str(e)}"], timeout=3)
 
     def stop_dictation(self, during_cleanup=False):
         if not self.is_dictating:
@@ -257,7 +257,7 @@ class DictationTrayApp:
         self.set_icon(False)
         if not during_cleanup and not self._shutting_down:
             try:
-                subprocess.run(["notify-send", "Dictation Tool", "Dictation stopped"], timeout=3)
+                subprocess.run(["notify-send", "-t", "3000", "Dictation Tool", "Dictation stopped"], timeout=3)
             except Exception:
                 pass
 
