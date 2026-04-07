@@ -37,7 +37,8 @@ def bootstrap():
     global WHISPER_MODEL
     print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({FASTER_WHISPER_DEVICE}/{FASTER_WHISPER_COMPUTE_TYPE})...")
     WHISPER_MODEL = WhisperModel(
-        FASTER_WHISPER_MODEL, device=FASTER_WHISPER_DEVICE, compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+        FASTER_WHISPER_MODEL, backend="onnx",
+        device=FASTER_WHISPER_DEVICE, compute_type=FASTER_WHISPER_COMPUTE_TYPE,
     )
     print("Model loaded successfully")
 
