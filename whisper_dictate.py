@@ -17,7 +17,10 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 from threading import Event, Thread
 
-warnings.filterwarnings("ignore", message=r"resource_tracker:.*semaphore")
+# Silence multiprocessing resource_tracker's leaked-semaphore warnings
+# Must be set before any multiprocessing activity; child processes inherit it
+os.environ["PYTHONWARNINGS"] = "ignore::UserWarning:multiprocessing.resource_tracker"
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
