@@ -37,14 +37,41 @@ WHISPER_MODEL = None
 
 
 
+def _probe_cuda_available():
+    """Check if CUDA is available by attempting a lightweight CTranslate2 init."""
+    try:
+        from ctranslate2 import get_cuda_runtime_version
+        get_cuda_runtime_version()
+        return True
+    except Exception:
+        return False
+
+
 def bootstrap():
-    """Initialize the faster-whisper model."""
+    """Initialize the faster-whisper model with CUDA fallback to CPU."""
     global WHISPER_MODEL
-    print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({FASTER_WHISPER_DEVICE}/{FASTER_WHISPER_COMPUTE_TYPE})...")
-    WHISPER_MODEL = WhisperModel(
-        FASTER_WHISPER_MODEL, device=FASTER_WHISPER_DEVICE, compute_type=FASTER_WHISPER_COMPUTE_TYPE,
-    )
-    print("Model loaded successfully")
+    device = FASTER_WHISPER_DEVICE
+    compute_type = FASTER_WHISPER_COMPUTE_TYPE
+
+    if device == "cuda" and not _probe_cuda_available():
+        print("WARNING: CUDA not available, falling back to CPU")
+        device = "cpu"
+        compute_type = "int8"
+
+    print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({device}/{compute_type})...")
+    try:
+        WHISPER_MODEL = WhisperModel(
+            FASTER_WHISPER_MODEL, device=device, compute_type=compute_type,
+        )
+        print("Model loaded successfully")
+    except Exception as e:
+        if device == "cpu":
+            raise
+        print(f"WARNING: Failed to load model with {device}, falling back to CPU: {e}")
+        WHISPER_MODEL = WhisperModel(
+            FASTER_WHISPER_MODEL, device="cpu", compute_type="int8",
+        )
+        print("Model loaded successfully (CPU fallback)")
 
 
 def resolve_device(device_arg):
@@ -152,9 +179,19 @@ def transcribe_and_type(audio):
     audio_normalized = audio.astype(np.float32) / 32767.0
     try:
         segments, info = WHISPER_MODEL.transcribe(audio_normalized, beam_size=5, language="en")
-        text = " ".join(seg.text for seg in segments).strip()
+    except RuntimeError as e:
+        if "libcublas" in str(e) or "CUDA" in str(e):
+            print(f"WARNING: CUDA runtime error during transcription: {e}")
+            return
+        raise
     except Exception:
         print("Transcription error:")
+        _traceback.print_exc()
+        return
+    try:
+        text = " ".join(seg.text for seg in segments).strip()
+    except Exception:
+        print("Transcription error: failed to iterate segments")
         _traceback.print_exc()
         return
     if not text:
@@ -297,8 +334,6 @@ if __name__ == "__main__":
                                 speech_chunks.clear()
                                 silent_blocks = 0
                                 in_speech = False
-                        if DEBUG_MODE:
-                            print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
                     else:
                         silent_blocks = 0
                         speech_chunks.append(block)
