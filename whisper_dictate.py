@@ -168,7 +168,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     if WHISPER_MODEL is None:
         print("WARNING: Whisper model not loaded, skipping transcription")
         return
-    if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
+    if "WAYLAND_DISPLAY" not in os.environ or "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
 
     audio_f32 = audio.astype(np.float32) / 32767.0
