@@ -169,7 +169,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
             vad_filter=TRANSCRIBE_VAD_FILTER,
             language="en",
             condition_on_previous_text=False,   # avoid hallucination loops
-            prompt="Transcribe verbatim.",       # prime the decoder
+            initial_prompt="Transcribe verbatim.",  # prime the decoder
         )
     except RuntimeError as e:
         if "libcublas" in str(e) or "CUDA" in str(e):
