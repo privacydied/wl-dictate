@@ -241,7 +241,6 @@ class DictationTrayApp:
     def stop_dictation(self, during_cleanup=False):
         if not self.is_dictating:
             return
-        self.is_dictating = False
         self._worker_event.clear()
 
         if self.dictation_process:

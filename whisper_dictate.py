@@ -361,61 +361,120 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             sys.exit(1)
 
-    # VAD-based streaming loop
-    # - Accumulate 0.3s blocks
-    # - Transcribe after 0.6s silence (~2 blocks)
-    # - Also force-transcribe every ~2.1s of speech so text appears during long speech
-    try:
-        silent_blocks = 0
-        speech_blocks = 0
-        buffer = []
+    # --- Streaming VAD loop with background transcription ---
+    import queue
+    import threading
 
-        while True:
-            block = record_chunk(BLOCK_DURATION, device_id=device_idx)
-            if block is None:
-                continue
+    # Use mutable containers so nested functions don't need nonlocal
+    _state = {
+        "lock": threading.Lock(),
+        "active_threads": [],
+        "silent_blocks": 0,
+        "speech_chunks": [],
+    }
 
-            rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
-
-            if rms >= VAD_RMS_THRESHOLD:
-                # Speech — accumulate
-                silent_blocks = 0
-                speech_blocks += 1
-                buffer.append(block)
-                if DEBUG_MODE:
-                    secs = speech_blocks * BLOCK_DURATION
-                    print(f"  🗣 speech (RMS {rms:.0f}) — {secs:.1f}s accumulated")
-
-                # Force transcribe if we've accumulated enough speech
-                if speech_blocks >= MAX_SPEECH_BLOCKS:
-                    full_audio = np.concatenate(buffer)
-                    buffer.clear()
-                    speech_blocks = 0
-                    if DEBUG_MODE:
-                        print(f"⚡ Force transcribe {len(full_audio) / SAMPLE_RATE:.1f}s")
-                    transcribe_and_type(full_audio)
-            else:
-                # Silence — increment counter
-                silent_blocks += 1
-                if DEBUG_MODE:
-                    print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
-
-                if len(buffer) > 0 and silent_blocks >= SILENCE_BLOCKS:
-                    # Enough silence — transcribe the accumulated buffer
-                    full_audio = np.concatenate(buffer)
-                    buffer.clear()
-                    silent_blocks = 0
-                    speech_blocks = 0
-                    if DEBUG_MODE:
-                        total_s = len(full_audio) / SAMPLE_RATE
-                        print(f"→ Transcribing {total_s:.1f}s of audio")
-                    transcribe_and_type(full_audio)
-
-    except KeyboardInterrupt:
-        # Flush remaining buffer on exit
-        if buffer:
-            full_audio = np.concatenate(buffer)
-            if DEBUG_MODE:
-                print(f"Final flush: {len(full_audio) / SAMPLE_RATE:.1f}s")
+    def _background_transcribe(audio_chunks, label=""):
+        """Transcribe accumulated audio in a background thread."""
+        if not audio_chunks:
+            return
+        full_audio = np.concatenate(audio_chunks)
+        if DEBUG_MODE:
+            print(f"  [{label}] transcribing {len(full_audio) / SAMPLE_RATE:.1f}s")
+        with _state["lock"]:
             transcribe_and_type(full_audio)
-        pass
+
+    def _cleanup_threads():
+        _state["active_threads"] = [t for t in _state["active_threads"] if t.is_alive()]
+
+    def _launch_transcribe(chunks, label=""):
+        _cleanup_threads()
+        t = threading.Thread(target=_background_transcribe, args=(chunks, label), daemon=True)
+        _state["active_threads"].append(t)
+        t.start()
+
+    silent_blocks = 0
+    speech_chunks = []
+
+    print("🎙️ Listening... (Ctrl+C to stop)")
+
+    # Use InputStream so recording never blocks
+    audio_queue = queue.Queue()
+
+    def _audio_callback(indata, frames, time_info, status):
+        if status:
+            if DEBUG_MODE:
+                print(f"  [stream] {status}")
+        audio_queue.put(indata.copy())
+
+    with sd.InputStream(
+        samplerate=None,  # use device native rate
+        channels=1,
+        dtype='float32',
+        device=device_idx,
+        callback=_audio_callback,
+        blocksize=int(SAMPLE_RATE * BLOCK_DURATION),
+    ):
+        # Get actual device sample rate for resampling
+        if device_idx is not None:
+            input_sr = int(sd.query_devices(device_idx, 'input')['default_samplerate'])
+        else:
+            input_sr = SAMPLE_RATE
+
+        try:
+            while True:
+                raw = audio_queue.get()
+                block = raw.flatten()
+
+                # Resample to 16kHz if needed
+                if input_sr != SAMPLE_RATE and len(block) > 0:
+                    target_len = int(len(block) * SAMPLE_RATE / input_sr)
+                    if target_len > 0:
+                        block = np.interp(
+                            np.linspace(0, len(block), target_len, endpoint=False),
+                            np.arange(len(block)),
+                            block,
+                        )
+
+                # Convert to int16
+                block = (np.clip(block, -1, 1) * 32767).astype(np.int16)
+
+                rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
+
+                if rms >= VAD_RMS_THRESHOLD:
+                    # Speech — accumulate
+                    silent_blocks = 0
+                    speech_chunks.append(block)
+                    total_s = len(block) / SAMPLE_RATE
+                    if DEBUG_MODE:
+                        print(f"  🗣 speech (RMS {rms:.0f}) +{total_s:.1f}s")
+
+                    # Force transcribe if accumulated enough speech
+                    total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
+                    if total_speech_s >= BLOCK_DURATION * MAX_SPEECH_BLOCKS:
+                        to_transcribe = list(speech_chunks)
+                        speech_chunks.clear()
+                        _launch_transcribe(to_transcribe, "forced")
+
+                else:
+                    # Silence
+                    silent_blocks += 1
+                    if DEBUG_MODE:
+                        print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
+
+                    if len(speech_chunks) > 0 and silent_blocks >= SILENCE_BLOCKS:
+                        to_transcribe = list(speech_chunks)
+                        speech_chunks.clear()
+                        silent_blocks = 0
+                        _launch_transcribe(to_transcribe, "silence")
+
+        except KeyboardInterrupt:
+            print("\n🛑 Stopping...")
+            if speech_chunks:
+                print(f"Final flush: {sum(len(c) for c in speech_chunks) / SAMPLE_RATE:.1f}s")
+                _launch_transcribe(list(speech_chunks), "final")
+
+    # Wait for remaining transcribe threads
+    import time as _time
+    _time.sleep(1)
+    for t in _state["active_threads"]:
+        t.join(timeout=60)
