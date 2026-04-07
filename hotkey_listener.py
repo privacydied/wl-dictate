@@ -2,7 +2,6 @@ import evdev
 import select
 import threading
 import time
-from queue import Queue
 
 
 class HotkeyListener(threading.Thread):

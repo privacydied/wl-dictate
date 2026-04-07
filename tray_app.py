@@ -1,4 +1,3 @@
-import logging
 import os
 import subprocess
 import sys
@@ -7,15 +6,11 @@ import atexit
 import time
 import socket
 import threading
-from logging.handlers import RotatingFileHandler
 import sounddevice as sd
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup, QAction
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QSocketNotifier, QTimer
 from whisper_dictate import bootstrap
-
-log = logging.getLogger(__name__)
-
 
 class WorkerMonitor(threading.Thread):
     """Watches the dictation worker subprocess and signals on exit."""
@@ -32,7 +27,7 @@ class WorkerMonitor(threading.Thread):
             return
         # exit_code < 0 means killed by signal (e.g. -15 = SIGTERM from terminate())
         if exit_code != 0 and exit_code != -15:
-            log.warning("Dictation worker exited abnormally (code %d)", exit_code)
+            print(f"WARNING: Dictation worker exited abnormally (code {exit_code})")
         self.tray_app._worker_event.set()
 
 
@@ -40,6 +35,7 @@ class DictationTrayApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.tray_icon = QSystemTrayIcon()
+        self._device_group = None
 
         atexit.register(self.cleanup)
         self.app.aboutToQuit.connect(self.cleanup)
@@ -147,7 +143,9 @@ class DictationTrayApp:
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r") as f:
-                    self.input_device = json.load(f).get("input_device")
+                    raw = json.load(f).get("input_device")
+                    if isinstance(raw, int):
+                        self.input_device = raw
             except (json.JSONDecodeError, OSError, ValueError, TypeError):
                 pass
 
@@ -187,6 +185,8 @@ class DictationTrayApp:
         reload_action.triggered.connect(self.reload_devices)
 
     def set_input_device(self, device_idx):
+        if not isinstance(device_idx, int):
+            return
         self.input_device = device_idx
         self.save_config()
         self.set_icon(self.is_dictating)
@@ -263,9 +263,18 @@ class DictationTrayApp:
 
     def _open_log_file(self):
         log_path = os.path.join(self.script_dir, "dictation.log")
-        handler = RotatingFileHandler(log_path, maxBytes=512 * 1024, backupCount=3)
-        handler.stream = handler._open()
-        return handler.stream
+        # Rotate on open: if file > 512KB, shift .1 → .2, .2 → .3, current → .1
+        try:
+            if os.path.getsize(log_path) > 512 * 1024:
+                for i in range(2, 0, -1):
+                    src = f"{log_path}.{i}"
+                    dst = f"{log_path}.{i + 1}"
+                    if os.path.exists(src):
+                        os.rename(src, dst)
+                os.rename(log_path, f"{log_path}.1")
+        except OSError:
+            pass
+        return open(log_path, "a")
 
     def cleanup(self):
         if self._cleaned:

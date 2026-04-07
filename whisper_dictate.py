@@ -8,7 +8,6 @@ import re
 import subprocess
 import sys
 import warnings
-from collections import deque
 from queue import Empty, Queue
 
 import numpy as np
@@ -132,7 +131,6 @@ def _guess_wayland_display() -> bool:
     """Try to infer WAYLAND_DISPLAY from runtime dirs."""
     candidates = ["/run/user/1000"]
     try:
-        import pwd
         candidates.append(f"/run/user/{os.getuid()}")
     except Exception:
         pass
@@ -142,10 +140,12 @@ def _guess_wayland_display() -> bool:
         except OSError:
             continue
         if sockets:
+            display = os.path.basename(sockets[0])
+            # Atomic assignment: build all values first, then set at once
             os.environ["XDG_RUNTIME_DIR"] = candidate
-            os.environ["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
+            os.environ["WAYLAND_DISPLAY"] = display
             _WTYPE_ENV["XDG_RUNTIME_DIR"] = candidate
-            _WTYPE_ENV["WAYLAND_DISPLAY"] = os.environ["WAYLAND_DISPLAY"]
+            _WTYPE_ENV["WAYLAND_DISPLAY"] = display
             print(f"Guessed WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
             return True
     return False
@@ -171,6 +171,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
             condition_on_previous_text=False,   # avoid hallucination loops
             initial_prompt="Transcribe verbatim.",  # prime the decoder
         )
+        text = " ".join(seg.text for seg in segments).strip()
     except RuntimeError as e:
         if "libcublas" in str(e) or "CUDA" in str(e):
             print(f"WARNING: CUDA error during transcription: {e}")
@@ -180,8 +181,6 @@ def transcribe_and_type(audio: np.ndarray) -> None:
         print("Transcription error:")
         sys.excepthook(*sys.exc_info())
         return
-
-    text = " ".join(seg.text for seg in segments).strip()
     if not text:
         print("Nothing recognized.")
         return
@@ -350,12 +349,16 @@ def main(device_arg: str | None = None) -> None:
 
                 # Runaway guard: force flush after MAX_SPEECH_BLOCKS
                 if _sample_count >= BLOCK_SAMPLES * MAX_SPEECH_BLOCKS:
+                    secs_before_reset = _sample_count / SAMPLE_RATE
                     _enqueue_transcribe(list(speech_chunks), "forced")
                     speech_chunks.clear()
                     _sample_count = 0
+                    silent_blocks = 0
+                    speech_peak_rms = 0.0
+                    energy_floor = float("inf")
                     in_speech = False
                     if DEBUG_MODE:
-                        print(f"  forced flush ({_sample_count / SAMPLE_RATE:.1f}s)")
+                        print(f"  forced flush ({secs_before_reset:.1f}s)")
 
         except KeyboardInterrupt:
             print("\nStopping...")

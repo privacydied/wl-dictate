@@ -26,12 +26,12 @@ def main():
             pass
         sys.exit(1)
 
+    sock = None
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1)
         sock.connect(SOCKET_PATH)
         sock.sendall(b"toggle")
-        sock.close()
     except (ConnectionRefusedError, OSError) as e:
         try:
             import subprocess
@@ -39,6 +39,9 @@ def main():
         except Exception:
             pass
         sys.exit(1)
+    finally:
+        if sock:
+            sock.close()
 
 
 if __name__ == "__main__":
