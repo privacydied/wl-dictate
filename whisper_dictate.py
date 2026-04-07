@@ -166,7 +166,6 @@ def transcribe_and_type(audio: np.ndarray) -> None:
         segments, _ = WHISPER_MODEL.transcribe(
             audio_f32,
             beam_size=TRANSCRIBE_BEAM_SIZE,
-            batch_size=TRANSCRIBE_BATCH_SIZE,
             vad_filter=TRANSCRIBE_VAD_FILTER,
             language="en",
             condition_on_previous_text=False,   # avoid hallucination loops
