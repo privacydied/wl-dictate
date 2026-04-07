@@ -3,7 +3,11 @@ import os
 import re
 import subprocess
 import sys
+import warnings
 import time
+
+# Suppress multiprocessing semaphore leak warnings from sounddevice shutdown
+warnings.filterwarnings("ignore", message=r"resource_tracker:.*semaphore")
 
 import numpy as np
 import sounddevice as sd
