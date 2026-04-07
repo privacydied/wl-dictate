@@ -11,12 +11,19 @@ import os
 import socket
 import sys
 
-SOCKET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dictation.sock")
+# Resolve the socket path relative to this script file, not CWD
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOCKET_PATH = os.path.join(SCRIPT_DIR, ".dictation.sock")
 
 
 def main():
     if not os.path.exists(SOCKET_PATH):
-        print("Dictation tray app is not running (socket not found).", file=sys.stderr)
+        # Tray app not running — notify the user via system notification
+        try:
+            import subprocess
+            subprocess.run(["notify-send", "Dictation", "Tray app is not running"])
+        except Exception:
+            pass
         sys.exit(1)
 
     try:
@@ -26,7 +33,11 @@ def main():
         sock.sendall(b"toggle")
         sock.close()
     except (ConnectionRefusedError, OSError) as e:
-        print(f"Failed to connect to dictation tray: {e}", file=sys.stderr)
+        try:
+            import subprocess
+            subprocess.run(["notify-send", "Dictation Error", str(e)])
+        except Exception:
+            pass
         sys.exit(1)
 
 

@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup, QAction
 from PyQt5.QtGui import QIcon
-from PyQt5.QtCore import QSocketNotifier
+from PyQt5.QtCore import QSocketNotifier, QTimer
 from whisper_dictate import bootstrap
 
 log = logging.getLogger(__name__)
@@ -58,9 +58,19 @@ class DictationTrayApp:
         # Connect aboutToQuit
         self.app.aboutToQuit.connect(self.cleanup)
 
-        # Set up signal handlers
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+        # Set up signal handlers via QTimer so they run on the Qt main thread
+        import signal as _signal
+        self._sig_flag = False
+
+        def _catch_signal(*_args):
+            self._sig_flag = True
+
+        _signal.signal(_signal.SIGINT, _catch_signal)
+        _signal.signal(_signal.SIGTERM, _catch_signal)
+
+        self._sig_timer = QTimer()
+        self._sig_timer.timeout.connect(self._check_signal)
+        self._sig_timer.start(250)  # check every 250ms
 
         # Get script directory
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -114,7 +124,7 @@ class DictationTrayApp:
             self._socket.bind(self._socket_path)
             self._socket.listen(5)
             self._socket.setblocking(False)
-            self._notifier = self.app.createSocketNotifier(self._socket.fileno(), 1)
+            self._notifier = QSocketNotifier(self._socket.fileno(), QSocketNotifier.Read)
             self._notifier.activated.connect(self._socket_ready)
         except Exception as e:
             print(f"Could not start socket listener: {e}")
@@ -133,9 +143,12 @@ class DictationTrayApp:
         except OSError:
             pass
 
-    def signal_handler(self, signum, frame):
-        self.cleanup()
-        sys.exit(0)
+    def _check_signal(self):
+        """Called by QTimer on the main thread — handles SIGINT/SIGTERM."""
+        if self._sig_flag:
+            self._sig_flag = False
+            self.cleanup()
+            self.app.quit()
 
     def on_icon_click(self, reason):
         if reason == QSystemTrayIcon.Trigger:
