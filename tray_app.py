@@ -4,6 +4,7 @@ import subprocess
 import signal
 import json
 import atexit
+import time
 import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup, QAction
 from PyQt5.QtGui import QIcon
@@ -149,7 +150,18 @@ class DictationTrayApp:
             cmd = [sys.executable, worker_script]
             if self.input_device is not None:
                 cmd.append(str(self.input_device))
-            self.dictation_process = subprocess.Popen(cmd)
+            # Forward display variables so wtype can reach Wayland
+            env = os.environ.copy()
+            for var in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP"):
+                if not os.environ.get(var):
+                    env.pop(var, None)
+            # Log worker output for debugging
+            log_path = os.path.join(self.script_dir, "dictation.log")
+            with open(log_path, "a") as log_f:
+                log_f.write(f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                self.dictation_process = subprocess.Popen(
+                    cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT
+                )
             self.is_dictating = True
             self.set_icon(True)
             subprocess.run(["notify-send", "Dictation Tool", "Dictation started"])

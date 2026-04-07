@@ -15,6 +15,8 @@ CHANNELS = 1
 WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = "whisper.cpp/models/ggml-base.en.bin"
 WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WHISPER_LIB_DIR = os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "src")
 DEBUG_MODE = True  # Set to False in production
 THREADS = 4  # Number of threads for whisper-cli
 WHISPER_TIMEOUT = 60  # max seconds for whisper-cli to transcribe one chunk
@@ -26,7 +28,7 @@ def _ensure_whisper_cli():
     if os.path.isfile(WHISPER_BINARY):
         return
     print("⚠️ whisper-cli not found — building from source…")
-    source_dir = os.path.dirname(WHISPER_BINARY).rsplit("/", 2)[0]  # whisper.cpp/
+    source_dir = os.path.join(SCRIPT_DIR, "whisper.cpp")
     if not os.path.isdir(source_dir):
         print(f"❌ whisper.cpp/ directory not found. Run: git submodule update --init --recursive")
         sys.exit(1)
@@ -193,13 +195,42 @@ def transcribe_and_type(audio):
     if audio is None:
         return
 
-    # Validate binaries before doing any work [REH][S3]
-    if not os.path.isfile(WHISPER_BINARY):
-        print(f"❌ whisper-cli not found at {WHISPER_BINARY}")
+    # Resolve WHISPER_BINARY relative to SCRIPT_DIR if needed
+    if not os.path.isabs(WHISPER_BINARY):
+        binary_path = os.path.join(SCRIPT_DIR, WHISPER_BINARY)
+    else:
+        binary_path = WHISPER_BINARY
+
+    # Resolve WHISPER_MODEL relative to SCRIPT_DIR
+    if not os.path.isabs(WHISPER_MODEL):
+        model_path = os.path.join(SCRIPT_DIR, WHISPER_MODEL)
+    else:
+        model_path = WHISPER_MODEL
+
+    # Validate binaries before doing any work
+    if not os.path.isfile(binary_path):
+        print(f"❌ whisper-cli not found at {binary_path}")
         return
-    if _find_executable("wtype") is None and not os.path.isfile("/usr/bin/wtype"):
+    if shutil.which("wtype") is None and not os.path.isfile("/usr/bin/wtype"):
         print("❌ wtype is not installed or not in PATH")
         return
+
+    # Validate model
+    if not os.path.isfile(model_path):
+        print(f"❌ Whisper model not found at {model_path}")
+        return
+
+    # Ensure wtype can reach the active display
+    if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
+        for candidate in ["/run/user/1000"] + [f"/run/user/{u}" for u in range(100, 9999)]:
+            # Check for a wayland display socket
+            import glob
+            sockets = glob.glob(os.path.join(candidate, "wayland-*"))
+            if sockets:
+                os.environ["XDG_RUNTIME_DIR"] = candidate
+                os.environ["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
+                print(f"🔧 Guessed WAYLAND_DISPLAY={os.environ['WAYLAND_DISPLAY']}")
+                break
 
     # Save audio to WAV file
     wav_fd = None
@@ -219,13 +250,16 @@ def transcribe_and_type(audio):
 
     # Transcribe using whisper-cli
     whisper_error = None
+    run_env = os.environ.copy()
+    run_env["LD_LIBRARY_PATH"] = WHISPER_LIB_DIR
     try:
         result = subprocess.run(
-            [WHISPER_BINARY, "-m", WHISPER_MODEL, "-f", wav_path, "-t", str(THREADS)],
+            [binary_path, "-m", model_path, "-f", wav_path, "-t", str(THREADS)],
             capture_output=True,
             text=True,
             check=True,
             timeout=WHISPER_TIMEOUT,
+            env=run_env,
         )
 
         # Extract transcription from stdout
@@ -261,10 +295,16 @@ def transcribe_and_type(audio):
 
             # Type out the transcription via wtype [REH][IV]
             try:
+                # Ensure wtype has the display environment
+                wtype_env = os.environ.copy()
+                if "DISPLAY" not in wtype_env:
+                    wtype_env["DISPLAY"] = ":0"
+
                 subprocess.run(
                     ["wtype", cleaned],
                     check=True,
                     timeout=WTYPE_TIMEOUT,
+                    env=wtype_env,
                 )
                 print(f"✍️ Typed: {cleaned}")
             except subprocess.TimeoutExpired:
