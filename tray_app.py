@@ -30,7 +30,9 @@ class WorkerMonitor(threading.Thread):
         exit_code = self.process.wait()
         if self._stop.is_set():
             return
-        if exit_code != 0:
+        # exit_code < 0 means killed by signal (e.g. -15 = SIGTERM from terminate())
+        # This is expected when stopping dictation normally
+        if exit_code != 0 and exit_code != -15:
             log.warning("Dictation worker exited abnormally (code %d)", exit_code)
         self.tray_app._worker_event.set()
 
