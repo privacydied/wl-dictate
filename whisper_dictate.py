@@ -203,6 +203,8 @@ def transcribe_and_type(audio):
     # Strip non-speech annotations and collapse whitespace
     text = re.sub(r"\([^)]*\)\s*", "", text)
     text = re.sub(r"\[[^\]]*\]\s*", "", text)
+    # Collapse dotted noise: "word . . . word" → "word ..."
+    text = re.sub(r"(?<=\w)\s+(?:\.\s+){2,}", " ...", text)
     text = re.sub(r"\s{2,}", " ", text).strip()
     if not text:
         print("Nothing recognized after cleanup.")
@@ -260,15 +262,12 @@ if __name__ == "__main__":
                 _transcribe_worker_done.set()
                 return
             full_audio = np.concatenate(audio_chunks)
-            total_samples = len(full_audio)
-            chunk_samples = int(TRANSCRIBE_CHUNK_SIZE * SAMPLE_RATE)
-            total_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
-            for i in range(0, max(1, total_samples), chunk_samples):
-                seg = full_audio[i:i + chunk_samples]
-                if DEBUG_MODE:
-                    seg_s = len(seg) / SAMPLE_RATE
-                    print(f"  [{label}] segment {i // chunk_samples + 1}/{total_chunks} ({seg_s:.1f}s)")
-                transcribe_and_type(seg)
+            total_s = len(full_audio) / SAMPLE_RATE
+            # Transcribe the entire buffer at once — whisper needs full context.
+            # Chunking at 5s with no overlap destroys sentence continuity.
+            if DEBUG_MODE:
+                print(f"  [{label}] transcribing {total_s:.1f}s in one pass")
+            transcribe_and_type(full_audio)
             _transcribe_queue.task_done()
 
     _worker_t = threading.Thread(target=_transcribe_worker, daemon=True)
@@ -283,6 +282,7 @@ if __name__ == "__main__":
     in_speech = False
     silence_debounce = 0
     energy_floor = float('inf')
+    speech_peak_rms = 0.0
     print("🎙️ Listening... (Ctrl+C to stop)")
     audio_queue = queue.Queue()
 
