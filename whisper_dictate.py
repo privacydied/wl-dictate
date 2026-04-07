@@ -1,140 +1,72 @@
 import glob
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
+from faster_whisper import WhisperModel
 
 # Config
-BLOCK_DURATION = 0.3       # seconds per recording block
-SILENCE_BLOCKS = 2         # blocks of silence to trigger transcribe (~0.6s pause)
-MAX_SPEECH_BLOCKS = 7      # force transcribe after ~2.1s of speech even without silence
+FASTER_WHISPER_MODEL = "tiny.en"
+FASTER_WHISPER_DEVICE = "cpu"
+FASTER_WHISPER_COMPUTE_TYPE = "int8"
+BLOCK_DURATION = 0.5
+SILENCE_BLOCKS = 2
+MAX_SPEECH_BLOCKS = 160
+TRANSCRIBE_CHUNK_SIZE = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
-WHISPER_BINARY = "whisper.cpp/build/bin/whisper-cli"
-WHISPER_MODEL_NAME = "tiny.en"  # tiny.en = near-instant on CPU
-DESIRED_MODEL_PATH = f"whisper.cpp/models/ggml-{WHISPER_MODEL_NAME}.bin"
-VAD_RMS_THRESHOLD = 500     # below this = silent block
-THREADS = 16                # Ryzen 3700X has 8C/16T
+VAD_RMS_THRESHOLD = 500
 WHISPER_TIMEOUT = 30
 WTYPE_TIMEOUT = 10
 DEBUG_MODE = True
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WHISPER_LIB_DIR = os.path.join(SCRIPT_DIR, "whisper.cpp", "build", "src")
-WHISPER_MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin"
 
-def _ensure_whisper_cli():
-    """Build whisper-cli from the whisper.cpp submodule if the binary is missing."""
-    if os.path.isfile(WHISPER_BINARY):
-        return
-    print("whisper-cli not found -- building from source...")
-    source_dir = os.path.join(SCRIPT_DIR, "whisper.cpp")
-    if not os.path.isdir(source_dir):
-        print("whisper.cpp/ directory not found. Run: git submodule update --init --recursive")
-        sys.exit(1)
-    subprocess.check_call(
-        ["make", "-j" + str(max(2, os.cpu_count() or 2))],
-        cwd=source_dir,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-    )
-    if not os.path.isfile(WHISPER_BINARY):
-        print("Build succeeded but whisper-cli still not found")
-        sys.exit(1)
-    print("whisper-cli built successfully")
-
-
-def _ensure_whisper_model():
-    """Download the configured whisper model if it's missing."""
-    if os.path.isfile(DESIRED_MODEL_PATH):
-        return
-    url = WHISPER_MODEL_URL.format(name=WHISPER_MODEL_NAME)
-    print(f"Whisper model not found -- downloading {url} ...")
-    model_dir = os.path.dirname(DESIRED_MODEL_PATH)
-    os.makedirs(model_dir, exist_ok=True)
-
-    download_script = os.path.join(model_dir, "download-ggml-model.sh")
-    if os.path.isfile(download_script):
-        subprocess.check_call(
-            [download_script, WHISPER_MODEL_NAME],
-            cwd=model_dir,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-    elif shutil.which("curl"):
-        dest = os.path.join(model_dir, os.path.basename(DESIRED_MODEL_PATH))
-        subprocess.check_call(
-            ["curl", "-#L", "-o", dest, url],
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-    elif shutil.which("wget"):
-        subprocess.check_call(
-            ["wget", "-O", os.path.join(model_dir, os.path.basename(DESIRED_MODEL_PATH)), url],
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-    else:
-        print(f"No curl or wget available. Download manually from {url}")
-        sys.exit(1)
-
-    if not os.path.isfile(DESIRED_MODEL_PATH):
-        print("Model download failed -- file not found after download")
-        sys.exit(1)
-    print("Whisper model downloaded successfully")
+WHISPER_MODEL = None
 
 
 def bootstrap():
-    """Ensure whisper-cli is built and the model is present."""
-    _ensure_whisper_cli()
-    _ensure_whisper_model()
+    """Initialize the faster-whisper model."""
+    global WHISPER_MODEL
+    print(f"Loading faster-whisper '{FASTER_WHISPER_MODEL}' ({FASTER_WHISPER_DEVICE}/{FASTER_WHISPER_COMPUTE_TYPE})...")
+    WHISPER_MODEL = WhisperModel(
+        FASTER_WHISPER_MODEL, device=FASTER_WHISPER_DEVICE, compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+    )
+    print("Model loaded successfully")
 
 
 def resolve_device(device_arg):
     """Resolve device argument to device index."""
     if device_arg is None:
-        return None  # use default
-
-    # Try as integer ID
+        return None
     try:
         return int(device_arg)
     except ValueError:
         pass
-
-    # Try to match exact name
     try:
         devices = sd.query_devices()
     except OSError as e:
         raise ValueError(f"Cannot query audio devices: {e}") from e
-
     for idx, dev in enumerate(devices):
         if device_arg == dev["name"]:
             return idx
-
-    # Try partial match
     for idx, dev in enumerate(devices):
         if device_arg in dev["name"]:
             return idx
-
     raise ValueError(f"No matching device for: {device_arg}")
 
 
 def _guess_wayland_display():
-    """Try to infer WAYLAND_DISPLAY from runtime dirs [W5]."""
+    """Try to infer WAYLAND_DISPLAY from runtime dirs."""
     candidates = ["/run/user/1000"]
     try:
         import pwd
-        uid = os.getuid()
-        candidates.append(f"/run/user/{uid}")
+        candidates.append(f"/run/user/{os.getuid()}")
     except Exception:
         pass
-
     for candidate in candidates:
         try:
             sockets = glob.glob(os.path.join(candidate, "wayland-*"))
@@ -157,191 +89,96 @@ def record_chunk(duration, device_id=None):
         except ValueError as e:
             print(f"Error: {e}")
             return None
-
-    # Validate device index
     try:
         devices = sd.query_devices()
     except OSError as e:
-        print(f"Cannot query audio devices: {e}")  # [W3]
+        print(f"Cannot query audio devices: {e}")
         return None
-
     input_devices = [i for i, dev in enumerate(devices) if dev["max_input_channels"] > 0]
-
     if device_idx is not None and device_idx not in input_devices:
-        print(f"Invalid input device index: {device_idx}. Available input devices: {input_devices}")
+        print(f"Invalid input device index: {device_idx}. Available: {input_devices}")
         return None
-
-    # Get device info for the selected device (or default)
     try:
         if device_idx is None:
             device_info = sd.query_devices(sd.default.device[0], "input")
         else:
             device_info = sd.query_devices(device_idx, "input")
     except OSError as e:
-        print(f"Cannot query device info: {e}")  # [W3]
+        print(f"Cannot query device info: {e}")
         return None
-
     input_sr = int(device_info["default_samplerate"])
-    input_channels = 1
-
     device_name = device_info.get("name", "unknown")
-    print(f"Recording from '{device_name}' at {input_sr} Hz, {input_channels} channel(s)")
-
-    # Record at device's native settings
-    audio = sd.rec(int(duration * input_sr),
-                   samplerate=input_sr,
-                   channels=input_channels,
-                   dtype='float32',
-                   device=device_idx)  # None means default
+    print(f"Recording from '{device_name}' at {input_sr} Hz, 1 channel(s)")
+    audio = sd.rec(int(duration * input_sr), samplerate=input_sr,
+                   channels=1, dtype='float32', device=device_idx)
     sd.wait()
-
-    # Handle multi-dimensional audio
     if audio.ndim > 1:
         audio = audio.squeeze()
-
-    # Validate audio
     if audio is None or len(audio) == 0 or np.isnan(audio).any():
         print("Warning: Invalid or empty audio buffer")
         return None
-
-    # Downmix to mono if needed
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
-
-    # Resample to 16kHz
     if input_sr != SAMPLE_RATE:
-        duration_original = len(audio) / input_sr
-        target_length = int(SAMPLE_RATE * duration_original)
-        audio = np.interp(
-            np.linspace(0, len(audio), target_length, endpoint=False),
-            np.arange(len(audio)),
-            audio,
-        )
-
-    # Convert to int16
+        dur = len(audio) / input_sr
+        target = int(SAMPLE_RATE * dur)
+        audio = np.interp(np.linspace(0, len(audio), target, endpoint=False),
+                          np.arange(len(audio)), audio)
     audio *= 32767
     audio = np.clip(audio, -32768, 32767).astype(np.int16)
-
-    # Check audio level
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
     if DEBUG_MODE:
         print(f"Audio RMS: {rms:.2f}")
-
     return audio
 
 
 def transcribe_and_type(audio):
-    """Transcribe audio via whisper-cli and type the result with wtype."""
+    """Transcribe audio via faster-whisper and type the result with wtype."""
     import traceback as _traceback
-
-    if audio is None:
+    if audio is None or WHISPER_MODEL is None:
         return
-
-    binary_path = os.path.join(SCRIPT_DIR, WHISPER_BINARY)
-    model_path = os.path.join(SCRIPT_DIR, DESIRED_MODEL_PATH)
-
-    if not os.path.isfile(binary_path):
-        print(f"whisper-cli not found at {binary_path}")
-        return
-    if not os.path.isfile(model_path):
-        print(f"Whisper model not found at {model_path}")
-        return
-
-    # Ensure Wayland env is available
     if "WAYLAND_DISPLAY" not in os.environ and "XDG_RUNTIME_DIR" not in os.environ:
         _guess_wayland_display()
-
-    wav_fd, wav_path = None, None
+    # Convert int16 audio to float32 normalized [-1.0, 1.0]
+    audio_normalized = audio.astype(np.float32) / 32767.0
     try:
-        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
-        os.close(wav_fd)
-        wavfile.write(wav_path, SAMPLE_RATE, audio)
-    except Exception as e:
-        print(f"Failed to write WAV: {e}")
-        return
-
-    # Transcribe using whisper-cli
-    run_env = os.environ.copy()
-    run_env["LD_LIBRARY_PATH"] = WHISPER_LIB_DIR
-    try:
-        result = subprocess.run(
-            [binary_path, "-m", model_path, "-f", wav_path, "-t", str(THREADS)],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=WHISPER_TIMEOUT,
-            env=run_env,
-        )
-
-        output = result.stdout
-        if DEBUG_MODE:
-            print(f"Raw whisper output: {output}")
-
-        transcription = output.strip()
-        if transcription:
-            # Remove SRT timestamps and index lines
-            cleaned = re.sub(r"\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*", "", transcription)
-            cleaned = re.sub(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\s*", "", cleaned, flags=re.MULTILINE)
-            cleaned = re.sub(r"^\d+\s*$", "", cleaned, flags=re.MULTILINE)
-            cleaned = re.sub(r"\s*\[\d{2}:\d{2}:\d{2}\.\d{3}.*", "", cleaned)
-            cleaned = " ".join(line.strip() for line in cleaned.splitlines() if line.strip()).strip()
-
-            # Strip non-speech annotations: (heavy breathing), [Music], etc.
-            cleaned = re.sub(r"\([^)]*\)\s*", "", cleaned)
-            cleaned = re.sub(r"\[[^\]]*\]\s*", "", cleaned)
-
-            # Collapse extra whitespace
-            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-
-            if not cleaned:
-                print("Nothing recognized after cleanup.")
-                return
-
-            if DEBUG_MODE:
-                print(f"Cleaned transcription: {repr(cleaned)}")
-
-            # Type via wtype, prepending a space to separate from prior text
-            try:
-                wtype_env = os.environ.copy()
-                if "DISPLAY" not in wtype_env:
-                    wtype_env["DISPLAY"] = ":1"
-                wtype_env.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
-                wtype_env.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
-
-                subprocess.run(
-                    ["wtype", " " + cleaned],
-                    check=True,
-                    timeout=WTYPE_TIMEOUT,
-                    env=wtype_env,
-                )
-                print(f"Typed: {cleaned}")
-            except subprocess.TimeoutExpired:
-                print("wtype timed out -- X11/Wayland may be unavailable or no focused window")
-            except subprocess.CalledProcessError as e:
-                print(f"wtype failed: {e.stderr.strip() if e.stderr else e}")
-            except FileNotFoundError:
-                print("wtype is not installed")
-        else:
-            print("Nothing recognized.")
-    except subprocess.TimeoutExpired:
-        print(f"whisper-cli timed out after {WHISPER_TIMEOUT}s")
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.strip() if e.stderr else str(e)
-        print(f"Transcription failed (exit {e.returncode}): {stderr}")
-    except FileNotFoundError:
-        print(f"whisper-cli not found at {binary_path}")
+        segments, info = WHISPER_MODEL.transcribe(audio_normalized, beam_size=5, language="en")
+        text = " ".join(seg.text for seg in segments).strip()
     except Exception:
-        print("Unexpected transcription error:")
+        print("Transcription error:")
         _traceback.print_exc()
-    finally:
-        if wav_path and os.path.exists(wav_path):
-            os.unlink(wav_path)
+        return
+    if not text:
+        print("Nothing recognized.")
+        return
+    # Strip non-speech annotations and collapse whitespace
+    text = re.sub(r"\([^)]*\)\s*", "", text)
+    text = re.sub(r"\[[^\]]*\]\s*", "", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if not text:
+        print("Nothing recognized after cleanup.")
+        return
+    if DEBUG_MODE:
+        print(f"Cleaned transcription: {repr(text)}")
+    # Type via wtype
+    try:
+        wtype_env = os.environ.copy()
+        if "DISPLAY" not in wtype_env:
+            wtype_env["DISPLAY"] = ":1"
+        wtype_env.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
+        wtype_env.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
+        subprocess.run(["wtype", " " + text], check=True, timeout=WTYPE_TIMEOUT, env=wtype_env)
+        print(f"Typed: {text}")
+    except subprocess.TimeoutExpired:
+        print("wtype timed out -- X11/Wayland may be unavailable or no focused window")
+    except subprocess.CalledProcessError as e:
+        print(f"wtype failed: {e.stderr.strip() if e.stderr else e}")
+    except FileNotFoundError:
+        print("wtype is not installed")
 
 
 if __name__ == "__main__":
     bootstrap()
-
-    # List devices if no arguments
     if len(sys.argv) == 1:
         print("Available input devices:")
         try:
@@ -351,7 +188,6 @@ if __name__ == "__main__":
                     print(f"  [{i}] {dev['name']} -- {dev['default_samplerate']} Hz")
         except OSError as e:
             print(f"Cannot query devices: {e}")
-
     device_arg = sys.argv[1] if len(sys.argv) > 1 else None
     device_idx = None
     if device_arg is not None:
@@ -361,120 +197,95 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             sys.exit(1)
 
-    # --- Streaming VAD loop with background transcription ---
     import queue
     import threading
 
-    # Use mutable containers so nested functions don't need nonlocal
-    _state = {
-        "lock": threading.Lock(),
-        "active_threads": [],
-        "silent_blocks": 0,
-        "speech_chunks": [],
-    }
+    _transcribe_queue = queue.Queue()
+    _transcribe_worker_done = threading.Event()
 
-    def _background_transcribe(audio_chunks, label=""):
-        """Transcribe accumulated audio in a background thread."""
-        if not audio_chunks:
-            return
-        full_audio = np.concatenate(audio_chunks)
-        if DEBUG_MODE:
-            print(f"  [{label}] transcribing {len(full_audio) / SAMPLE_RATE:.1f}s")
-        with _state["lock"]:
-            transcribe_and_type(full_audio)
+    def _transcribe_worker():
+        while True:
+            try:
+                audio_chunks, label = _transcribe_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if audio_chunks is None:
+                _transcribe_worker_done.set()
+                return
+            full_audio = np.concatenate(audio_chunks)
+            total_samples = len(full_audio)
+            chunk_samples = int(TRANSCRIBE_CHUNK_SIZE * SAMPLE_RATE)
+            total_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
+            for i in range(0, max(1, total_samples), chunk_samples):
+                seg = full_audio[i:i + chunk_samples]
+                if DEBUG_MODE:
+                    seg_s = len(seg) / SAMPLE_RATE
+                    print(f"  [{label}] segment {i // chunk_samples + 1}/{total_chunks} ({seg_s:.1f}s)")
+                transcribe_and_type(seg)
+            _transcribe_queue.task_done()
 
-    def _cleanup_threads():
-        _state["active_threads"] = [t for t in _state["active_threads"] if t.is_alive()]
+    _worker_t = threading.Thread(target=_transcribe_worker, daemon=True)
+    _worker_t.start()
 
-    def _launch_transcribe(chunks, label=""):
-        _cleanup_threads()
-        t = threading.Thread(target=_background_transcribe, args=(chunks, label), daemon=True)
-        _state["active_threads"].append(t)
-        t.start()
+    def _enqueue_transcribe(chunks, label=""):
+        _transcribe_queue.put((chunks, label))
 
     silent_blocks = 0
     speech_chunks = []
-
     print("🎙️ Listening... (Ctrl+C to stop)")
-
-    # Use InputStream so recording never blocks
     audio_queue = queue.Queue()
 
     def _audio_callback(indata, frames, time_info, status):
-        if status:
-            if DEBUG_MODE:
-                print(f"  [stream] {status}")
+        if status and DEBUG_MODE:
+            print(f"  [stream] {status}")
         audio_queue.put(indata.copy())
 
     with sd.InputStream(
-        samplerate=None,  # use device native rate
-        channels=1,
-        dtype='float32',
-        device=device_idx,
-        callback=_audio_callback,
+        samplerate=None, channels=1, dtype='float32',
+        device=device_idx, callback=_audio_callback,
         blocksize=int(SAMPLE_RATE * BLOCK_DURATION),
     ):
-        # Get actual device sample rate for resampling
         if device_idx is not None:
             input_sr = int(sd.query_devices(device_idx, 'input')['default_samplerate'])
         else:
             input_sr = SAMPLE_RATE
-
         try:
             while True:
                 raw = audio_queue.get()
                 block = raw.flatten()
-
-                # Resample to 16kHz if needed
                 if input_sr != SAMPLE_RATE and len(block) > 0:
                     target_len = int(len(block) * SAMPLE_RATE / input_sr)
                     if target_len > 0:
                         block = np.interp(
                             np.linspace(0, len(block), target_len, endpoint=False),
-                            np.arange(len(block)),
-                            block,
+                            np.arange(len(block)), block,
                         )
-
-                # Convert to int16
                 block = (np.clip(block, -1, 1) * 32767).astype(np.int16)
-
                 rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
-
                 if rms >= VAD_RMS_THRESHOLD:
-                    # Speech — accumulate
                     silent_blocks = 0
                     speech_chunks.append(block)
-                    total_s = len(block) / SAMPLE_RATE
-                    if DEBUG_MODE:
-                        print(f"  🗣 speech (RMS {rms:.0f}) +{total_s:.1f}s")
-
-                    # Force transcribe if accumulated enough speech
                     total_speech_s = sum(len(c) for c in speech_chunks) / SAMPLE_RATE
+                    if DEBUG_MODE:
+                        print(f"  🗣 speech (RMS {rms:.0f}) +{len(block) / SAMPLE_RATE:.1f}s")
                     if total_speech_s >= BLOCK_DURATION * MAX_SPEECH_BLOCKS:
                         to_transcribe = list(speech_chunks)
                         speech_chunks.clear()
-                        _launch_transcribe(to_transcribe, "forced")
-
+                        _enqueue_transcribe(to_transcribe, "forced")
                 else:
-                    # Silence
                     silent_blocks += 1
                     if DEBUG_MODE:
                         print(f"  🔇 silence {silent_blocks}/{SILENCE_BLOCKS}")
-
                     if len(speech_chunks) > 0 and silent_blocks >= SILENCE_BLOCKS:
                         to_transcribe = list(speech_chunks)
                         speech_chunks.clear()
                         silent_blocks = 0
-                        _launch_transcribe(to_transcribe, "silence")
-
+                        _enqueue_transcribe(to_transcribe, "silence")
         except KeyboardInterrupt:
             print("\n🛑 Stopping...")
             if speech_chunks:
                 print(f"Final flush: {sum(len(c) for c in speech_chunks) / SAMPLE_RATE:.1f}s")
-                _launch_transcribe(list(speech_chunks), "final")
+                _enqueue_transcribe(list(speech_chunks), "final")
 
-    # Wait for remaining transcribe threads
-    import time as _time
-    _time.sleep(1)
-    for t in _state["active_threads"]:
-        t.join(timeout=60)
+    _transcribe_queue.put((None, None))
+    _transcribe_worker_done.wait(timeout=60)
