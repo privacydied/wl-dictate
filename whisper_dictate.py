@@ -238,15 +238,20 @@ def _transcribe_worker_loop() -> None:
         if audio_chunks is None:
             _TRANSCRIBE_DONE.set()
             return
-        # Fast path for single chunk (common case — avoids np.concatenate overhead)
-        if len(audio_chunks) == 1:
-            full_audio = audio_chunks[0]
-        else:
-            full_audio = np.concatenate(audio_chunks)
-        if DEBUG_MODE:
-            print(f"  [{label}] transcribing {len(full_audio) / SAMPLE_RATE:.1f}s")
-        transcribe_and_type(full_audio)
-        _TRANSCRIBE_QUEUE.task_done()
+        try:
+            # Fast path for single chunk (common case — avoids np.concatenate overhead)
+            if len(audio_chunks) == 1:
+                full_audio = audio_chunks[0]
+            else:
+                full_audio = np.concatenate(audio_chunks)
+            if DEBUG_MODE:
+                print(f"  [{label}] transcribing {len(full_audio) / SAMPLE_RATE:.1f}s")
+            transcribe_and_type(full_audio)
+        except Exception:
+            print("Worker transcription error (thread continues):")
+            sys.excepthook(*sys.exc_info())
+        finally:
+            _TRANSCRIBE_QUEUE.task_done()
 
 
 def _enqueue_transcribe(chunks: list[np.ndarray], label: str = "") -> None:
@@ -378,6 +383,7 @@ def main(device_arg: str | None = None) -> None:
                     silent_blocks = 0
                     speech_peak_rms = 0.0
                     energy_floor = float("inf")
+                    silence_debounce = 0
                     in_speech = False
                     if DEBUG_MODE:
                         print(f"  forced flush ({secs_before_reset:.1f}s)")

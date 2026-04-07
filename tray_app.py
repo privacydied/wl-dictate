@@ -130,6 +130,8 @@ class DictationTrayApp:
             if self._intentional_stop:
                 self._intentional_stop = False
                 return
+            if self._shutting_down:
+                return  # don't spam notification during shutdown
             if self.is_dictating:
                 self.is_dictating = False
                 self.set_icon(False)
@@ -295,11 +297,17 @@ class DictationTrayApp:
         self._intentional_stop = True
         self._worker_event.clear()
         if self.dictation_process:
-            self.dictation_process.terminate()
+            try:
+                self.dictation_process.terminate()
+            except ProcessLookupError:
+                pass  # already dead
             try:
                 self.dictation_process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                self.dictation_process.kill()
+                try:
+                    self.dictation_process.kill()
+                except ProcessLookupError:
+                    pass
                 self.dictation_process.wait(timeout=2.0)
             self.dictation_process = None
         if self._worker_monitor:
