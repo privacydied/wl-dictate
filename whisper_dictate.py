@@ -60,11 +60,14 @@ _RE_SENTENCE_PUNCT = re.compile(r"([!?;:])(\s)?")
 _RE_COMMA_SPACE = re.compile(r",(\s)?")
 _RE_WHITESPACE = re.compile(r"\s+")
 _RE_LEADING_PUNCT_SPACE = re.compile(r"^[.,!?;:][\s\u00A0\u200B\u200C\u200D\u2060]*")
+_RE_STARTS_WITH_WORD = re.compile(r"^[A-Za-z0-9]")
+_RE_ENDS_WITH_SENTENCE_PUNCT = re.compile(r"[.!?;:][\"')\]]*$")
 
 # Process-wide state
 WHISPER_MODEL: WhisperModel | None = None
 _WTYPE_ENV: dict[str, str] = {}
 _WTYPE_CMD: list[str] = []
+_LAST_TYPED_ENDED_WITH_SENTENCE_PUNCT = False
 
 # ── Bootstrap ───────────────────────────────────────────────────────────────
 
@@ -172,6 +175,8 @@ def _guess_wayland_display() -> bool:
 
 def transcribe_and_type(audio: np.ndarray) -> None:
     """Transcribe audio and type the result via wtype."""
+    global _LAST_TYPED_ENDED_WITH_SENTENCE_PUNCT
+
     if WHISPER_MODEL is None:
         print("WARNING: Whisper model not loaded, skipping transcription")
         return
@@ -214,6 +219,10 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     if not text:
         print("Nothing recognized after cleanup.")
         return
+
+    if _LAST_TYPED_ENDED_WITH_SENTENCE_PUNCT and _RE_STARTS_WITH_WORD.match(text):
+        text = f" {text}"
+
     if DEBUG_MODE:
         print(f"Cleaned transcription: {repr(text)}")
 
@@ -221,6 +230,9 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     try:
         cmd = _WTYPE_CMD + [text]
         subprocess.run(cmd, check=True, timeout=WTYPE_TIMEOUT, env=_WTYPE_ENV)
+        _LAST_TYPED_ENDED_WITH_SENTENCE_PUNCT = bool(
+            _RE_ENDS_WITH_SENTENCE_PUNCT.search(text)
+        )
         print(f"Typed: {text}")
     except subprocess.TimeoutExpired:
         print("wtype timed out")
