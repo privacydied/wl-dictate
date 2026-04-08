@@ -30,6 +30,28 @@ class WorkerMonitor(threading.Thread):
         self.tray_app._worker_event.set()
 
 
+class WorkerLogRelay(threading.Thread):
+    """Tee worker stdout into the log file and detect readiness."""
+
+    def __init__(self, tray_app, process):
+        super().__init__(daemon=True)
+        self.tray_app = tray_app
+        self.process = process
+
+    def run(self):
+        stream = self.process.stdout
+        if stream is None:
+            return
+        for line in stream:
+            self.tray_app._write_worker_log(line)
+            if "Listening..." in line:
+                self.tray_app._worker_ready_event.set()
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 class DictationTrayApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -54,8 +76,12 @@ class DictationTrayApp:
 
         self.dictation_process = None
         self._worker_monitor = None
+        self._worker_log_relay = None
         self._worker_event = threading.Event()
+        self._worker_ready_event = threading.Event()
+        self._log_lock = threading.Lock()
         self._log_file = None
+        self._worker_ready = False
         self.is_dictating = False
         self._intentional_stop = False
         self._cleaned = False
@@ -185,6 +211,18 @@ class DictationTrayApp:
             self.app.quit()
 
     def _check_worker(self):
+        if self._worker_ready_event.is_set():
+            self._worker_ready_event.clear()
+            if self.is_dictating and not self._worker_ready:
+                self._worker_ready = True
+                try:
+                    subprocess.run(
+                        ["notify-send", "-t", "3000", "Dictation Tool", "Dictation ready"],
+                        timeout=3,
+                    )
+                except Exception:
+                    pass
+
         if self._worker_event.is_set():
             self._worker_event.clear()
             if self._intentional_stop:
@@ -194,6 +232,7 @@ class DictationTrayApp:
                 return  # don't spam notification during shutdown
             if self.is_dictating:
                 self.is_dictating = False
+                self._worker_ready = False
                 self.set_icon(False)
                 try:
                     subprocess.run(
@@ -366,20 +405,27 @@ class DictationTrayApp:
             ):
                 if not os.environ.get(var):
                     env.pop(var, None)
+            env["PYTHONUNBUFFERED"] = "1"
             self._log_file = self._open_log_file()
-            self._log_file.write(
+            self._write_worker_log(
                 f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
             )
             if notice:
-                self._log_file.write(f"{notice}\n")
+                self._write_worker_log(f"{notice}\n")
             if device_info is not None:
-                self._log_file.write(
+                self._write_worker_log(
                     f"Using input device {device_idx}: {device_info.get('name', 'unknown')}\n"
                 )
-            self._log_file.flush()
             self._worker_event.clear()
+            self._worker_ready_event.clear()
+            self._worker_ready = False
             self.dictation_process = subprocess.Popen(
-                cmd, env=env, stdout=self._log_file, stderr=subprocess.STDOUT
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
             self.is_dictating = True
             self.set_icon(True)
@@ -389,10 +435,12 @@ class DictationTrayApp:
                     "-t",
                     "3000",
                     "Dictation Tool",
-                    notice or "Dictation started",
+                    notice or "Warming up dictation...",
                 ],
                 timeout=3,
             )
+            self._worker_log_relay = WorkerLogRelay(self, self.dictation_process)
+            self._worker_log_relay.start()
             self._worker_monitor = WorkerMonitor(self, self.dictation_process)
             self._worker_monitor.start()
         except Exception as e:
@@ -466,6 +514,15 @@ class DictationTrayApp:
         except OSError:
             pass
         return open(log_path, "a")
+
+    def _write_worker_log(self, text):
+        if not text:
+            return
+        with self._log_lock:
+            if not self._log_file:
+                return
+            self._log_file.write(text)
+            self._log_file.flush()
 
     def cleanup(self):
         if self._cleaned:

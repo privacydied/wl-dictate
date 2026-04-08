@@ -82,7 +82,14 @@ Stops with `Ctrl+C`.
 
 On Hyprland, the tray app now repairs or installs a runtime **Ctrl+Alt+F** bind that executes `toggle_dictation.py` through `hyprctl`, so it works without raw `/dev/input/*` access or `sudo`.
 
-If you want to add it manually, use:
+If you want to add it manually in your Hyprland config, use your own clean project paths:
+
+```ini
+exec = /mnt/nasirjones/py/wl-dictate/.venv/bin/python3 /mnt/nasirjones/py/wl-dictate/tray_app.py
+bind = CTRL ALT, f, exec, /mnt/nasirjones/py/wl-dictate/.venv/bin/python3 /mnt/nasirjones/py/wl-dictate/toggle_dictation.py
+```
+
+Or as a one-off runtime command:
 
 ```bash
 hyprctl keyword bind "CTRL ALT, F, exec, python /full/path/to/toggle_dictation.py"
