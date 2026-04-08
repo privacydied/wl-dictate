@@ -6,7 +6,7 @@ It runs as a PyQt5 tray app, keeps a faster-whisper worker warm in the backgroun
 
 ![Hyprland tray example](example.jpg)
 
-Example tray appearance on Hyprland. The tray icon/menu is the main control surface for starting dictation, switching microphones, and quitting the app.
+Example tray appearance on Hyprland. `tray_app.py` The tray icon/menu (the literal microphone, fourth from the right) is the main control surface for starting dictation, switching microphones, and quitting the app.
 
 ## What it does
 
@@ -96,8 +96,8 @@ The intended Wayland path is a compositor bind that triggers `toggle_dictation.p
 Hyprland example:
 
 ```ini
-exec = /mnt/nasirjones/py/wl-dictate/.venv/bin/python3 /mnt/nasirjones/py/wl-dictate/tray_app.py
-bind = CTRL ALT, f, exec, /mnt/nasirjones/py/wl-dictate/.venv/bin/python3 /mnt/nasirjones/py/wl-dictate/toggle_dictation.py
+exec = python /home/pry/wl-dictate/tray_app.py
+bind = CTRL ALT, f, exec, python /home/pry/wl-dictate/toggle_dictation.py
 ```
 
 Notes:
