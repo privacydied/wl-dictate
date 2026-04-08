@@ -24,8 +24,8 @@ def main():
             import subprocess
 
             subprocess.run(
-                ["notify-send", "Dictation", "Tray app is not running"],
-                timeout=5,
+                ["notify-send", "-t", "3000", "Dictation", "Tray app is not running"],
+                timeout=3,
             )
         except Exception:
             pass
@@ -41,7 +41,10 @@ def main():
         try:
             import subprocess
 
-            subprocess.run(["notify-send", "Dictation Error", str(e)], timeout=5)
+            subprocess.run(
+                ["notify-send", "-t", "3000", "Dictation Error", str(e)],
+                timeout=3,
+            )
         except Exception:
             pass
         sys.exit(1)

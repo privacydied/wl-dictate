@@ -197,37 +197,68 @@ class DictationTrayApp:
         reload_action = self.device_menu.addAction("Reload Devices")
         reload_action.triggered.connect(self.reload_devices)
 
+    def _get_input_device_info(self, device_idx):
+        if not isinstance(device_idx, int):
+            return None
+        try:
+            return sd.query_devices(device_idx, "input")
+        except Exception:
+            return None
+
+    def _resolve_start_device(self):
+        device_info = self._get_input_device_info(self.input_device)
+        if device_info is not None:
+            return self.input_device, device_info, None
+
+        try:
+            default_input, _ = sd.default.device
+        except Exception:
+            default_input = None
+        if default_input is None:
+            self.input_device = None
+            self.save_config()
+            return None, None, "Saved microphone is unavailable and no default input device is configured."
+
+        default_info = self._get_input_device_info(default_input)
+        if default_info is None:
+            self.input_device = None
+            self.save_config()
+            return None, None, "No working input device is available."
+
+        self.input_device = int(default_input)
+        self.save_config()
+        return self.input_device, default_info, "Saved microphone disappeared; switched to the default input."
+
     def set_input_device(self, device_idx):
         if not isinstance(device_idx, int):
+            return
+        device_info = self._get_input_device_info(device_idx)
+        if device_info is None:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "-t",
+                    "3000",
+                    "Dictation Tool",
+                    f"Input device {device_idx} is unavailable",
+                ],
+                timeout=3,
+            )
             return
         self.input_device = device_idx
         self.save_config()
         self.set_icon(self.is_dictating)
-        try:
-            name = sd.query_devices(device_idx, "input").get(
-                "name", f"device {device_idx}"
-            )
-            subprocess.run(
-                [
-                    "notify-send",
-                    "-t",
-                    "3000",
-                    "Dictation Tool",
-                    f"Input device set to: {name}",
-                ],
-                timeout=3,
-            )
-        except OSError:
-            subprocess.run(
-                [
-                    "notify-send",
-                    "-t",
-                    "3000",
-                    "Dictation Tool",
-                    f"Input device set to index {device_idx}",
-                ],
-                timeout=3,
-            )
+        name = device_info.get("name", f"device {device_idx}")
+        subprocess.run(
+            [
+                "notify-send",
+                "-t",
+                "3000",
+                "Dictation Tool",
+                f"Input device set to: {name}",
+            ],
+            timeout=3,
+        )
 
     def set_icon(self, active):
         icon_path = os.path.join(
@@ -245,10 +276,24 @@ class DictationTrayApp:
         if self.is_dictating:
             return
         try:
+            device_idx, device_info, notice = self._resolve_start_device()
+            if device_idx is None and device_info is None:
+                subprocess.run(
+                    [
+                        "notify-send",
+                        "-t",
+                        "5000",
+                        "Dictation Tool Error",
+                        notice or "No working input device is available.",
+                    ],
+                    timeout=3,
+                )
+                return
+
             worker_script = os.path.join(self.script_dir, "whisper_dictate.py")
             cmd = [sys.executable, worker_script]
-            if self.input_device is not None:
-                cmd.append(str(self.input_device))
+            if device_idx is not None:
+                cmd.append(str(device_idx))
             env = os.environ.copy()
             for var in (
                 "DISPLAY",
@@ -262,6 +307,12 @@ class DictationTrayApp:
             self._log_file.write(
                 f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
             )
+            if notice:
+                self._log_file.write(f"{notice}\n")
+            if device_info is not None:
+                self._log_file.write(
+                    f"Using input device {device_idx}: {device_info.get('name', 'unknown')}\n"
+                )
             self._log_file.flush()
             self._worker_event.clear()
             self.dictation_process = subprocess.Popen(
@@ -270,7 +321,13 @@ class DictationTrayApp:
             self.is_dictating = True
             self.set_icon(True)
             subprocess.run(
-                ["notify-send", "-t", "3000", "Dictation Tool", "Dictation started"],
+                [
+                    "notify-send",
+                    "-t",
+                    "3000",
+                    "Dictation Tool",
+                    notice or "Dictation started",
+                ],
                 timeout=3,
             )
             self._worker_monitor = WorkerMonitor(self, self.dictation_process)

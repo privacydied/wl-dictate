@@ -12,14 +12,13 @@ class HotkeyListener(threading.Thread):
         self._running.set()
         self.keyboard_devices = []
         self.pressed_keys = set()
-        # Accept both left and right modifiers for Ctrl+Alt+D [H2]
-        self.hotkey_combination = {
+        self.modifier_keys = {
             evdev.ecodes.KEY_LEFTCTRL,
             evdev.ecodes.KEY_RIGHTCTRL,
             evdev.ecodes.KEY_LEFTALT,
             evdev.ecodes.KEY_RIGHTALT,
-            evdev.ecodes.KEY_D,
         }
+        self.trigger_key = evdev.ecodes.KEY_F
         self._devices_lock = threading.Lock()
         self._open_devices = []  # track open handles for cleanup [H3]
 
@@ -61,12 +60,6 @@ class HotkeyListener(threading.Thread):
 
                 with self._devices_lock:
                     devices_to_watch = list(self.keyboard_devices)
-                    all_modifiers = {
-                        evdev.ecodes.KEY_LEFTCTRL,
-                        evdev.ecodes.KEY_RIGHTCTRL,
-                        evdev.ecodes.KEY_LEFTALT,
-                        evdev.ecodes.KEY_RIGHTALT,
-                    }
                 r, w, x = select.select(devices_to_watch, [], [], 0.1)
                 for device in r:
                     try:
@@ -78,10 +71,10 @@ class HotkeyListener(threading.Thread):
                                         self.pressed_keys.add(scancode)
                                     elif event.value == 0:  # Key up
                                         self.pressed_keys.discard(scancode)
-                                        # Check hotkey on release of the trigger key [H1]
                                         if (
-                                            self.pressed_keys <= all_modifiers
-                                            and scancode == evdev.ecodes.KEY_D
+                                            scancode == self.trigger_key
+                                            and self.pressed_keys
+                                            and self.pressed_keys <= self.modifier_keys
                                         ):
                                             self.callback()
                     except (OSError, IOError):
@@ -101,7 +94,7 @@ class HotkeyListener(threading.Thread):
 if __name__ == "__main__":
 
     def test_callback():
-        print("Hotkey triggered: Ctrl+Alt+D")
+        print("Hotkey triggered: Ctrl+Alt+F")
 
     listener = HotkeyListener(test_callback)
     listener.start()
