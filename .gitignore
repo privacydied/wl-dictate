@@ -3,3 +3,4 @@ __pycache__/
 whisper.cpp/
 *.log
 .venv/
+nuitka-crash-report.xml

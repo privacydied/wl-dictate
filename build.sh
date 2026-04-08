@@ -27,6 +27,13 @@ python3 -m nuitka \
     --include-package-data=faster_whisper \
     --include-package-data=ctranslate2 \
     --assume-yes-for-downloads \
+    --noinclude-pytest-mode=nofollow \
+    --noinclude-setuptools-mode=nofollow \
+    --nofollow-import-to=cv2 \
+    --nofollow-import-to=torch \
+    --nofollow-import-to=PIL \
+    --nofollow-import-to=matplotlib \
+    --nofollow-import-to=PyQt6 \
     wl_dictate.py
 
 echo ""
