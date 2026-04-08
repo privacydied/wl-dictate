@@ -55,7 +55,8 @@ WHISPER_TIMEOUT = 30
 _RE_PARENS = re.compile(r"\([^)]*\)\s*")
 _RE_BRACKETS = re.compile(r"\[[^\]]*\]\s*")
 _RE_DOTS = re.compile(r"(?:\s*\.\s*){3,}")
-_RE_WHITESPACE = re.compile(r"\s{2,}")
+_RE_WHITESPACE = re.compile(r"\s+")
+_RE_LEADING_PUNCT_SPACE = re.compile(r"^[\s\u00A0\u200B\u200C\u200D\u2060]+")
 
 # Process-wide state
 WHISPER_MODEL: WhisperModel | None = None
@@ -112,7 +113,7 @@ def bootstrap() -> None:
     _WTYPE_ENV = os.environ.copy()
     _WTYPE_ENV.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
     _WTYPE_ENV.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
-    _WTYPE_CMD = ["wtype", " "]
+    _WTYPE_CMD = ["wtype"]
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────
@@ -202,6 +203,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     text = _RE_PARENS.sub("", text)
     text = _RE_BRACKETS.sub("", text)
     text = _RE_DOTS.sub("...", text)
+    text = _RE_LEADING_PUNCT_SPACE.sub("", text)
     text = _RE_WHITESPACE.sub(" ", text).strip()
     if not text:
         print("Nothing recognized after cleanup.")
