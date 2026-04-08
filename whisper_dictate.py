@@ -55,11 +55,11 @@ WHISPER_TIMEOUT = 30
 _RE_PARENS = re.compile(r"\([^)]*\)\s*")
 _RE_BRACKETS = re.compile(r"\[[^\]]*\]\s*")
 _RE_DOTS = re.compile(r"(?:\s*\.\s*){3,}")
-_RE_SENTENCE_PERIOD = re.compile(r"(?<=[A-Za-z])\.(?=[A-Za-z])")
-_RE_SENTENCE_PUNCT = re.compile(r"(?<=[A-Za-z])([!?;:])(?=[A-Za-z])")
-_RE_COMMA_SPACE = re.compile(r"(?<=[A-Za-z]),(?=[A-Za-z])")
+_RE_SENTENCE_PERIOD = re.compile(r"(?<=[A-Za-z])\.(?!\s)")
+_RE_SENTENCE_PUNCT = re.compile(r"(?<=[A-Za-z])([!?;:])(?!\s)")
+_RE_COMMA_SPACE = re.compile(r"(?<=[A-Za-z]),(?!\s)")
 _RE_WHITESPACE = re.compile(r"\s+")
-_RE_LEADING_PUNCT_SPACE = re.compile(r"^[\s\u00A0\u200B\u200C\u200D\u2060]+")
+_RE_LEADING_PUNCT_SPACE = re.compile(r"^[.,!?;:][\s\u00A0\u200B\u200C\u200D\u2060]*")
 
 # Process-wide state
 WHISPER_MODEL: WhisperModel | None = None
