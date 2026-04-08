@@ -258,12 +258,21 @@ def _enqueue_transcribe(chunks: list[np.ndarray], label: str = "") -> None:
     _TRANSCRIBE_QUEUE.put((chunks, label))
 
 
-def main(device_arg: str | None = None) -> None:
-    global _sample_count
+def _resolve_input_sample_rate(device_idx: int | None) -> int:
+    if device_idx is None:
+        return SAMPLE_RATE
+    dev_info = sd.query_devices(device_idx, "input")
+    raw_sr = dev_info.get("default_samplerate")
+    if raw_sr is None or raw_sr <= 0:
+        print(
+            f"WARNING: Device {device_idx} reports invalid samplerate {raw_sr}, using default {SAMPLE_RATE}"
+        )
+        return SAMPLE_RATE
+    return int(raw_sr)
 
-    # Start transcription worker
-    worker = Thread(target=_transcribe_worker_loop, daemon=True)
-    worker.start()
+
+def run_dictation_session(device_arg: str | None = None, stop_event: Event | None = None) -> None:
+    global _sample_count
 
     audio_queue: Queue[np.ndarray] = Queue()
 
@@ -282,19 +291,7 @@ def main(device_arg: str | None = None) -> None:
         callback=_audio_callback,
         blocksize=BLOCK_SAMPLES,
     ):
-        if device_idx is not None:
-            dev_info = sd.query_devices(device_idx, "input")
-            raw_sr = dev_info.get("default_samplerate")
-            if raw_sr is None or raw_sr <= 0:
-                print(
-                    f"WARNING: Device {device_idx} reports invalid samplerate {raw_sr}, using default {SAMPLE_RATE}"
-                )
-                input_sr = SAMPLE_RATE
-            else:
-                input_sr = int(raw_sr)
-        else:
-            input_sr = SAMPLE_RATE
-
+        input_sr = _resolve_input_sample_rate(device_idx)
         silent_blocks = 0
         speech_chunks: list[np.ndarray] = []
         ema_rms = 0.0
@@ -302,15 +299,20 @@ def main(device_arg: str | None = None) -> None:
         silence_debounce = 0
         energy_floor = float("inf")
         speech_peak_rms = 0.0
+        _sample_count = 0
 
         print("Listening... (Ctrl+C to stop)")
 
         try:
             while True:
-                raw = audio_queue.get()
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    raw = audio_queue.get(timeout=0.1)
+                except Empty:
+                    continue
                 block = raw.flatten()
 
-                # Resample if device samplerate differs from target
                 if input_sr != SAMPLE_RATE and len(block) > 0:
                     target_len = int(len(block) * SAMPLE_RATE / input_sr)
                     if target_len > 0:
@@ -320,15 +322,12 @@ def main(device_arg: str | None = None) -> None:
                             block,
                         )
 
-                # Scale to int16 range for VAD thresholds
                 block = np.clip(block, -1, 1) * 32767
                 block = block.astype(np.int16)
 
-                # RMS energy
                 rms = np.sqrt(np.mean(block.astype(np.float32) ** 2))
                 _sample_count += len(block)
 
-                # EMA smoothing & floor tracking
                 ema_rms = VAD_EMA_ALPHA * rms + EMA_INVERSE * ema_rms
                 if not in_speech and ema_rms < energy_floor:
                     energy_floor = ema_rms
@@ -374,7 +373,6 @@ def main(device_arg: str | None = None) -> None:
                             if DEBUG_MODE:
                                 print(f"  onset at EMA {ema_rms:.0f}")
 
-                # Runaway guard: force flush after MAX_SPEECH_BLOCKS
                 if _sample_count >= BLOCK_SAMPLES * MAX_SPEECH_BLOCKS:
                     secs_before_reset = _sample_count / SAMPLE_RATE
                     _enqueue_transcribe(list(speech_chunks), "forced")
@@ -390,23 +388,102 @@ def main(device_arg: str | None = None) -> None:
 
         except KeyboardInterrupt:
             print("\nStopping...")
+        finally:
             if speech_chunks:
                 secs = _sample_count / SAMPLE_RATE
                 print(f"Final flush: {secs:.1f}s")
                 _enqueue_transcribe(list(speech_chunks), "final")
 
+
+def controlled_main() -> None:
+    command_queue: Queue[str | None] = Queue()
+    stop_event = Event()
+    quit_event = Event()
+    session_thread: Thread | None = None
+
+    def _reader() -> None:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                command_queue.put(None)
+                return
+            command_queue.put(line.strip())
+
+    def _start_session(device_arg: str | None) -> Thread:
+        def _run() -> None:
+            try:
+                run_dictation_session(device_arg=device_arg, stop_event=stop_event)
+            except Exception:
+                print("Session error:")
+                sys.excepthook(*sys.exc_info())
+            finally:
+                stop_event.clear()
+                print("Session stopped")
+
+        thread = Thread(target=_run, daemon=True)
+        thread.start()
+        return thread
+
+    Thread(target=_reader, daemon=True).start()
+    print("Worker ready")
+
+    while not quit_event.is_set():
+        try:
+            command = command_queue.get(timeout=0.1)
+        except Empty:
+            continue
+        if command is None:
+            quit_event.set()
+            stop_event.set()
+            break
+        if not command:
+            continue
+        if command == "quit":
+            quit_event.set()
+            stop_event.set()
+            break
+        if command == "stop":
+            stop_event.set()
+            if session_thread is not None:
+                session_thread.join(timeout=2.0)
+                session_thread = None
+            continue
+        if command.startswith("start"):
+            if session_thread is not None and session_thread.is_alive():
+                continue
+            parts = command.split(maxsplit=1)
+            device_arg = parts[1] if len(parts) > 1 else None
+            stop_event.clear()
+            session_thread = _start_session(device_arg)
+
+    if session_thread is not None and session_thread.is_alive():
+        session_thread.join(timeout=2.0)
+    _TRANSCRIBE_QUEUE.put((None, ""))
+    _TRANSCRIBE_DONE.wait(timeout=60)
+
+
+def main(device_arg: str | None = None) -> None:
+    run_dictation_session(device_arg=device_arg)
     _TRANSCRIBE_QUEUE.put((None, ""))
     _TRANSCRIBE_DONE.wait(timeout=60)
 
 
 if __name__ == "__main__":
+    controlled_mode = len(sys.argv) > 1 and sys.argv[1] == "--controlled"
     bootstrap()
-    if len(sys.argv) == 1:
-        print("Available input devices:")
-        try:
-            for i, dev in enumerate(sd.query_devices()):
-                if dev["max_input_channels"] > 0:
-                    print(f"  [{i}] {dev['name']} -- {dev['default_samplerate']} Hz")
-        except OSError as e:
-            print(f"Cannot query devices: {e}")
-    main(device_arg=sys.argv[1] if len(sys.argv) > 1 else None)
+
+    worker = Thread(target=_transcribe_worker_loop, daemon=True)
+    worker.start()
+
+    if controlled_mode:
+        controlled_main()
+    else:
+        if len(sys.argv) == 1:
+            print("Available input devices:")
+            try:
+                for i, dev in enumerate(sd.query_devices()):
+                    if dev["max_input_channels"] > 0:
+                        print(f"  [{i}] {dev['name']} -- {dev['default_samplerate']} Hz")
+            except OSError as e:
+                print(f"Cannot query devices: {e}")
+        main(device_arg=sys.argv[1] if len(sys.argv) > 1 else None)
