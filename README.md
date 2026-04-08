@@ -72,7 +72,7 @@ Python packages used by the code:
 Use the project venv if you have one:
 
 ```bash
-/mnt/nasirjones/py/wl-dictate/.venv/bin/python3 /mnt/nasirjones/py/wl-dictate/tray_app.py
+python tray_app.py
 ```
 
 Or from the repo directory:
