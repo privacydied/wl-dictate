@@ -78,15 +78,23 @@ python whisper_dictate.py "USB Microphone"
 
 Stops with `Ctrl+C`.
 
-### Hotkey Listener
+### Wayland Hotkey (no sudo)
 
-Listens for **Ctrl+Alt+D** at the raw input-device level (works regardless of focus/DE):
+On Hyprland, the tray app now repairs or installs a runtime **Ctrl+Alt+F** bind that executes `toggle_dictation.py` through `hyprctl`, so it works without raw `/dev/input/*` access or `sudo`.
+
+If you want to add it manually, use:
+
+```bash
+hyprctl keyword bind "CTRL ALT, F, exec, python /full/path/to/toggle_dictation.py"
+```
+
+### Legacy Raw Hotkey Listener
+
+`hotkey_listener.py` is still available, but it reads raw input devices and therefore needs elevated access:
 
 ```bash
 sudo python hotkey_listener.py
 ```
-
-> **Note:** Requires `sudo` (or appropriate udev rules) because it reads raw `/dev/input/event*` devices.
 
 ## Configuration
 

@@ -6,6 +6,7 @@ import atexit
 import time
 import socket
 import threading
+from pathlib import Path
 import sounddevice as sd
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup
 from PyQt5.QtGui import QIcon
@@ -68,6 +69,7 @@ class DictationTrayApp:
         self._socket = None
         self._notifier = None
         self._start_socket_listener()
+        self._ensure_wayland_hotkey_binding()
 
         self.set_icon(False)
         self.tray_icon.show()
@@ -113,6 +115,67 @@ class DictationTrayApp:
             if data == "toggle":
                 self.toggle_dictation()
         except OSError:
+            pass
+
+    def _run_hyprctl(self, *args):
+        return subprocess.run(
+            ["hyprctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+
+    def _ensure_wayland_hotkey_binding(self):
+        if os.environ.get("XDG_CURRENT_DESKTOP") != "Hyprland":
+            return
+        toggle_script = Path(self.script_dir) / "toggle_dictation.py"
+        if not toggle_script.exists():
+            return
+        try:
+            result = self._run_hyprctl("-j", "binds")
+            if result.returncode != 0:
+                return
+            binds = json.loads(result.stdout)
+        except Exception:
+            return
+
+        matching_bind = None
+        conflicting_bind = None
+        expected_suffix = str(toggle_script)
+        for bind in binds:
+            if bind.get("key", "").lower() != "f":
+                continue
+            if bind.get("modmask") != 12:
+                continue
+            arg = bind.get("arg", "")
+            if "toggle_dictation.py" in arg:
+                matching_bind = bind
+                if expected_suffix in arg:
+                    return
+            else:
+                conflicting_bind = bind
+
+        if conflicting_bind is not None:
+            return
+
+        if matching_bind is not None:
+            self._run_hyprctl("keyword", "unbind", "CTRL ALT, F")
+
+        command = f"{sys.executable} {toggle_script}"
+        bind_value = f"CTRL ALT, F, exec, {command}"
+        bind_result = self._run_hyprctl("keyword", "bind", bind_value)
+        if bind_result.returncode != 0:
+            return
+        message = "Installed Hyprland Ctrl+Alt+F dictation toggle"
+        if matching_bind is not None:
+            message = "Repaired Hyprland Ctrl+Alt+F dictation toggle"
+        try:
+            subprocess.run(
+                ["notify-send", "-t", "3000", "Dictation Tool", message],
+                timeout=3,
+            )
+        except Exception:
             pass
 
     def _check_signals(self):
