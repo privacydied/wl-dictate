@@ -75,7 +75,8 @@ class DictationTrayApp:
         self._sig_timer.start(250)
 
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.config_path = os.path.join(self.script_dir, "config.json")
+        self._binary_dir = os.path.dirname(os.path.abspath(sys.executable))
+        self.config_path = self._resolve_config_path()
         self.load_config()
 
         self.dictation_process = None
@@ -97,7 +98,7 @@ class DictationTrayApp:
         self._worker_timer.timeout.connect(self._check_worker)
         self._worker_timer.start(WORKER_TIMER_MS)
 
-        self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
+        self._socket_path = os.path.join(self._binary_dir, ".dictation.sock")
         self._socket = None
         self._notifier = None
         self._start_socket_listener()
@@ -159,12 +160,21 @@ class DictationTrayApp:
             check=False,
         )
 
+    def _get_toggle_command(self):
+        """Return the shell command to toggle dictation."""
+        if self._is_compiled():
+            return sys.executable + " --toggle"
+        toggle_script = Path(self.script_dir) / "toggle_dictation.py"
+        return f"{sys.executable} {toggle_script}"
+
     def _ensure_wayland_hotkey_binding(self):
         if os.environ.get("XDG_CURRENT_DESKTOP") != "Hyprland":
             return
-        toggle_script = Path(self.script_dir) / "toggle_dictation.py"
-        if not toggle_script.exists():
-            return
+        toggle_command = self._get_toggle_command()
+        if not self._is_compiled():
+            toggle_script = Path(self.script_dir) / "toggle_dictation.py"
+            if not toggle_script.exists():
+                return
         try:
             result = self._run_hyprctl("-j", "binds")
             if result.returncode != 0:
@@ -175,16 +185,15 @@ class DictationTrayApp:
 
         matching_bind = None
         conflicting_bind = None
-        expected_suffix = str(toggle_script)
         for bind in binds:
             if bind.get("key", "").lower() != "f":
                 continue
             if bind.get("modmask") != 12:
                 continue
             arg = bind.get("arg", "")
-            if "toggle_dictation.py" in arg:
+            if "toggle_dictation" in arg or "--toggle" in arg:
                 matching_bind = bind
-                if expected_suffix in arg:
+                if toggle_command in arg:
                     return
             else:
                 conflicting_bind = bind
@@ -195,8 +204,7 @@ class DictationTrayApp:
         if matching_bind is not None:
             self._run_hyprctl("keyword", "unbind", "CTRL ALT, F")
 
-        command = f"{sys.executable} {toggle_script}"
-        bind_value = f"CTRL ALT, F, exec, {command}"
+        bind_value = f"CTRL ALT, F, exec, {toggle_command}"
         bind_result = self._run_hyprctl("keyword", "bind", bind_value)
         if bind_result.returncode != 0:
             return
@@ -391,10 +399,23 @@ class DictationTrayApp:
         except Exception as e:
             self._write_worker_log(f"Prewarm failed: {e}\n")
 
+    def _is_compiled(self):
+        """Check if running as a Nuitka/PyInstaller compiled binary."""
+        return "__compiled__" in globals() or getattr(sys, "frozen", False)
+
+    def _get_worker_command(self):
+        """Return the command to spawn the whisper worker subprocess."""
+        if self._is_compiled():
+            # Compiled binary: call self with --worker flag
+            return [sys.executable, "--worker"]
+        # Source mode: call python3 whisper_dictate.py --controlled
+        worker_script = os.path.join(self.script_dir, "whisper_dictate.py")
+        return [sys.executable, worker_script, "--controlled"]
+
     def _ensure_worker_process(self):
         if self.dictation_process and self.dictation_process.poll() is None:
             return
-        worker_script = os.path.join(self.script_dir, "whisper_dictate.py")
+        worker_cmd = self._get_worker_command()
         env = os.environ.copy()
         for var in (
             "DISPLAY",
@@ -413,7 +434,7 @@ class DictationTrayApp:
         self._worker_booted = False
         self._worker_ready = False
         self.dictation_process = subprocess.Popen(
-            [sys.executable, worker_script, "--controlled"],
+            worker_cmd,
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -426,9 +447,32 @@ class DictationTrayApp:
         self._worker_monitor = WorkerMonitor(self, self.dictation_process)
         self._worker_monitor.start()
 
+    def _resolve_config_path(self):
+        """Find config.json — prefer writable location next to binary."""
+        candidates = [
+            os.path.join(self._binary_dir, "config.json"),   # next to binary (writable)
+            os.path.join(self.script_dir, "config.json"),    # source dir / extract dir
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        # Default: writable location next to binary
+        return candidates[0]
+
+    def _resource_path(self, filename):
+        """Find a resource file — handles both source and compiled binary."""
+        candidates = [
+            os.path.join(self.script_dir, filename),       # source / onefile extract dir
+            os.path.join(os.path.dirname(sys.executable), filename),  # next to binary
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]  # fallback
+
     def set_icon(self, active):
-        icon_path = os.path.join(
-            self.script_dir, "mic-on.png" if active else "mic-off.png"
+        icon_path = self._resource_path(
+            "mic-on.png" if active else "mic-off.png"
         )
         self.tray_icon.setIcon(QIcon(icon_path))
         status = "ON" if active else "OFF"
@@ -521,7 +565,7 @@ class DictationTrayApp:
                 pass
 
     def _open_log_file(self):
-        log_path = os.path.join(self.script_dir, "dictation.log")
+        log_path = os.path.join(self._binary_dir, "dictation.log")
         # Rotate on open: if file > 512KB, shift .1 → .2, .2 → .3, current → .1
         try:
             if os.path.getsize(log_path) > 512 * 1024:

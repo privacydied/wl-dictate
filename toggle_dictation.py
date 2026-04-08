@@ -12,9 +12,18 @@ import os
 import socket
 import sys
 
-# Resolve the socket path relative to this script file, not CWD
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SOCKET_PATH = os.path.join(SCRIPT_DIR, ".dictation.sock")
+def _find_socket():
+    """Find .dictation.sock — check binary dir first, then script dir."""
+    binary_dir = os.path.dirname(os.path.abspath(sys.executable))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for d in (binary_dir, script_dir):
+        path = os.path.join(d, ".dictation.sock")
+        if os.path.exists(path):
+            return path
+    # Default: next to binary
+    return os.path.join(binary_dir, ".dictation.sock")
+
+SOCKET_PATH = _find_socket()
 
 
 def main():
