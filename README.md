@@ -15,7 +15,7 @@ Voice dictation for Wayland/X11 Linux — records your mic, transcribes with Whi
 |---|---|
 | `tray_app.py` | System tray app (tray icon, device selector, start/stop) |
 | `whisper_dictate.py` | Recording + transcription + typing worker |
-| `hotkey_listener.py` | Raw evdev keyboard listener for Ctrl+Alt+D hotkey |
+| `hotkey_listener.py` | Raw evdev keyboard listener for Ctrl+Alt+F hotkey |
 | `config.json` | Saves selected input device |
 | `whisper.cpp/` | Git submodule — source for whisper-cli binary |
 
