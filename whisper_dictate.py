@@ -55,6 +55,7 @@ WHISPER_TIMEOUT = 30
 _RE_PARENS = re.compile(r"\([^)]*\)\s*")
 _RE_BRACKETS = re.compile(r"\[[^\]]*\]\s*")
 _RE_DOTS = re.compile(r"(?:\s*\.\s*){3,}")
+_RE_SENTENCE_PERIOD = re.compile(r"(?<=[A-Za-z])\.(?=[A-Za-z])")
 _RE_WHITESPACE = re.compile(r"\s+")
 _RE_LEADING_PUNCT_SPACE = re.compile(r"^[\s\u00A0\u200B\u200C\u200D\u2060]+")
 
@@ -203,6 +204,7 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     text = _RE_PARENS.sub("", text)
     text = _RE_BRACKETS.sub("", text)
     text = _RE_DOTS.sub("...", text)
+    text = _RE_SENTENCE_PERIOD.sub(". ", text)
     text = _RE_LEADING_PUNCT_SPACE.sub("", text)
     text = _RE_WHITESPACE.sub(" ", text).strip()
     if not text:
