@@ -8,6 +8,8 @@ import socket
 import threading
 from pathlib import Path
 import sounddevice as sd
+
+WORKER_TIMER_MS = 100
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QActionGroup
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import QSocketNotifier, QTimer
@@ -93,7 +95,7 @@ class DictationTrayApp:
 
         self._worker_timer = QTimer()
         self._worker_timer.timeout.connect(self._check_worker)
-        self._worker_timer.start(500)
+        self._worker_timer.start(WORKER_TIMER_MS)
 
         self._socket_path = os.path.join(self.script_dir, ".dictation.sock")
         self._socket = None

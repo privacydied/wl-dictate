@@ -31,9 +31,9 @@ FASTER_WHISPER_COMPUTE_TYPE = "float16"
 TRANSCRIBE_BEAM_SIZE = 2  # tiny.en gains nothing from beam>2
 TRANSCRIBE_VAD_FILTER = True  # built-in Silero VAD trims silence from audio
 
-BLOCK_DURATION = 0.5  # seconds per VAD evaluation block
+BLOCK_DURATION = 0.2  # seconds per VAD evaluation block
 SILENCE_BLOCKS = 2  # consecutive quiet blocks to flush
-MAX_SPEECH_BLOCKS = 30  # forced flush after ~15s
+MAX_SPEECH_BLOCKS = 75  # forced flush after ~15s
 SAMPLE_RATE = 16000
 
 VAD_EMA_ALPHA = 0.3  # EMA smoothing factor
@@ -44,7 +44,7 @@ VAD_SILENCE_RATIO = 0.25  # silence when EMA drops below 25% of peak
 SILENCE_DEBLOCK_BLOCKS = 2  # hysteresis after flushing
 
 WTYPE_TIMEOUT = 10
-DEBUG_MODE = True
+DEBUG_MODE = os.environ.get("WL_DICTATE_DEBUG") == "1"
 
 # Pre-computed constants (avoid re-evaluation every block)
 BLOCK_SAMPLES = int(SAMPLE_RATE * BLOCK_DURATION)
