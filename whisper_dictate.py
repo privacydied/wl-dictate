@@ -423,12 +423,18 @@ def controlled_main() -> None:
     session_thread: Thread | None = None
 
     def _reader() -> None:
-        while True:
-            line = sys.stdin.readline()
-            if not line:
-                command_queue.put(None)
-                return
-            command_queue.put(line.strip())
+        try:
+            while True:
+                line = sys.stdin.readline()
+                if not line:
+                    break  # EOF
+                command_queue.put(line.strip())
+        except Exception:
+            # Exception on stdin (e.g., broken pipe); signal shutdown
+            print("Reader thread error:")
+            sys.excepthook(*sys.exc_info())
+        finally:
+            command_queue.put(None)
 
     def _start_session(device_arg: str | None) -> Thread:
         def _run() -> None:

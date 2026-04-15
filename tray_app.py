@@ -385,8 +385,12 @@ class DictationTrayApp:
     def _send_worker_command(self, command):
         if not self.dictation_process or self.dictation_process.stdin is None:
             raise RuntimeError("Dictation worker is not running")
-        self.dictation_process.stdin.write(f"{command}\n")
-        self.dictation_process.stdin.flush()
+        try:
+            self.dictation_process.stdin.write(f"{command}\n")
+            self.dictation_process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Worker closed stdin or died; treat as worker not running
+            raise RuntimeError("Dictation worker is not running (stdin closed)")
 
     def _prewarm_worker(self):
         try:
