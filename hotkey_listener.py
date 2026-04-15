@@ -58,25 +58,26 @@ class HotkeyListener(threading.Thread):
                     self._running.wait(1.0)
                     continue
 
-                with self._devices_lock:
+               with self._devices_lock:
                     devices_to_watch = list(self.keyboard_devices)
-                r, w, x = select.select(devices_to_watch, [], [], 0.1)
-                for device in r:
-                    try:
-                        for event in device.read():
-                            if event.type == evdev.ecodes.EV_KEY:
-                                scancode = event.code
-                                with self._devices_lock:
-                                    if event.value == 1:  # Key down
-                                        self.pressed_keys.add(scancode)
-                                    elif event.value == 0:  # Key up
-                                        self.pressed_keys.discard(scancode)
-                                        if (
-                                            scancode == self.trigger_key
-                                            and self.pressed_keys
-                                            and self.pressed_keys <= self.modifier_keys
-                                        ):
-                                            self.callback()
+                    r, w, x = select.select(devices_to_watch, [], [], 0.1)
+                    for device in r:
+                        try:
+                            for event in device.read():
+                                if event.type == evdev.ecodes.EV_KEY:
+                                    scancode = event.code
+                                    with self._devices_lock:
+                                        if event.value == 1:  # Key down
+                                            self.pressed_keys.add(scancode)
+                                        elif event.value == 0:  # Key up
+                                            self.pressed_keys.discard(scancode)
+                                            # CRITICAL: Check hotkey while holding lock to prevent race
+                                            if (
+                                                scancode == self.trigger_key
+                                                and self.pressed_keys
+                                                and self.pressed_keys <= self.modifier_keys
+                                            ):
+                                                self.callback()
                     except (OSError, IOError):
                         with self._devices_lock:
                             self.keyboard_devices = []

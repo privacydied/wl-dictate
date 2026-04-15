@@ -211,8 +211,9 @@ def transcribe_and_type(audio: np.ndarray) -> None:
     text = _RE_PARENS.sub("", text)
     text = _RE_BRACKETS.sub("", text)
     text = _RE_COMMA_SPACE.sub(", ", text)
-    text = _RE_DOTS.sub("... ", text)
+    # CRITICAL: sentence_period BEFORE dots - prevents . from being added inside ellipsis
     text = _RE_SENTENCE_PERIOD.sub(". ", text)
+    text = _RE_DOTS.sub("... ", text)
     text = _RE_SENTENCE_PUNCT.sub(r"\1 ", text)
     text = _RE_LEADING_PUNCT_SPACE.sub("", text)
     text = _RE_WHITESPACE.sub(" ", text).strip()
