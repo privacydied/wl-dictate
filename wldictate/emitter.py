@@ -69,11 +69,20 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
 class WtypeEmitter(Emitter):
     """Types text into the focused window with wtype (append-only)."""
 
-    def __init__(self, timeout_s: float = 10.0, delay_ms: int = 6) -> None:
+    def __init__(
+        self,
+        timeout_s: float = 10.0,
+        delay_ms: int = 6,
+        press_delay_ms: int = 40,
+    ) -> None:
         self._timeout = timeout_s
         # Per-keystroke delay. Electron/Chromium apps drop characters (spaces,
         # punctuation) when events arrive too fast; `wtype -d <ms>` paces them.
         self._delay_ms = max(0, int(delay_ms))
+        # Settle delay before the first keystroke of each call (`wtype -s`).
+        # Electron drops the first keystroke of a fresh burst — usually the
+        # delta's leading space — fusing words; this gives the window time.
+        self._press_delay_ms = max(0, int(press_delay_ms))
         self._env = os.environ.copy()
         _guess_wayland_env(self._env)
 
@@ -84,6 +93,8 @@ class WtypeEmitter(Emitter):
         # argv word: text that begins with "-" (e.g. a spoken dash) would
         # otherwise be misparsed as a flag ("Missing argument to -foo").
         cmd = ["wtype"]
+        if self._press_delay_ms > 0:
+            cmd += ["-s", str(self._press_delay_ms)]
         if self._delay_ms > 0:
             cmd += ["-d", str(self._delay_ms)]
         cmd.append("-")
@@ -113,7 +124,11 @@ class WtypeEmitter(Emitter):
 
 
 def make_emitter(
-    mode: str, *, wtype_timeout_s: float = 10.0, wtype_delay_ms: int = 6
+    mode: str,
+    *,
+    wtype_timeout_s: float = 10.0,
+    wtype_delay_ms: int = 6,
+    wtype_press_delay_ms: int = 40,
 ) -> Emitter:
     """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null)."""
     override = os.environ.get("WL_DICTATE_EMIT", "").strip().lower()
@@ -122,4 +137,8 @@ def make_emitter(
         return NullEmitter()
     if choice == "stdout":
         return StdoutEmitter()
-    return WtypeEmitter(timeout_s=wtype_timeout_s, delay_ms=wtype_delay_ms)
+    return WtypeEmitter(
+        timeout_s=wtype_timeout_s,
+        delay_ms=wtype_delay_ms,
+        press_delay_ms=wtype_press_delay_ms,
+    )

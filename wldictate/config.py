@@ -96,6 +96,12 @@ class TypingConfig:
     # punctuation — when keystrokes arrive too fast; a small delay fixes it.
     # 0 = no delay (fastest; fine for native GTK/Qt fields).
     wtype_delay_ms: int = 6
+    # Settle delay (ms) BEFORE the first keystroke of each wtype call, passed as
+    # `wtype -s`. Each commit is a separate wtype invocation, and Electron often
+    # drops the *first* keystroke of a fresh burst — which is the delta's leading
+    # space, so words fuse ("TestingTesting"). This pre-delay lets the target
+    # window be ready. 0 = disabled.
+    wtype_press_delay_ms: int = 40
     # Type a single trailing space after sentence-final punctuation when an
     # utterance ends, so manual typing can continue naturally.
     sentence_trailing_space: bool = True

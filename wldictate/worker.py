@@ -99,6 +99,7 @@ def _run_session(
         cfg.typing.mode,
         wtype_timeout_s=cfg.typing.wtype_timeout_s,
         wtype_delay_ms=cfg.typing.wtype_delay_ms,
+        wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
     )
     # Fresh formatter per session: the cursor may have moved anywhere between
     # toggles, so spacing context must never leak across sessions (a stale
