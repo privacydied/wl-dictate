@@ -3,5 +3,17 @@ __pycache__/
 whisper.cpp/
 *.log
 .venv/
-nuitka-crash-report.xml
 config.json
+
+# Build artifacts — never commit these; build locally instead.
+# PyInstaller:
+dist/
+build/
+*.spec
+# Nuitka:
+wl-dictate.dist/
+wl-dictate.build/
+wl-dictate.onefile-build/
+nuitka-crash-report.xml
+# The bundled binary itself (both build scripts emit dist/wl-dictate):
+/wl-dictate

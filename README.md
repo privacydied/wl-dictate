@@ -83,23 +83,62 @@ Environment overrides: `WL_DICTATE_EMIT=stdout|null` (debug/benchmark: print or 
 
 ## Requirements
 
-System: `wtype`, `portaudio`, Python ≥ 3.13, optionally an NVIDIA GPU (CUDA) — CPU fallback works.
+- **OS:** Linux with Wayland or X11. Python ≥ 3.13.
+- **System:** `wtype` (types the text), `portaudio` (mic capture backend).
+- **GPU (optional):** an NVIDIA GPU with CUDA + cuDNN. Without it, the worker
+  transparently falls back to CPU (`int8`), which is still realtime for the
+  `distil-small.en` default.
 
-Python (see `pyproject.toml`): `PyQt5`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`, `onnxruntime`.
+### Arch Linux (`paru`)
+
+Some deps live in the official repos, the rest come from PyPI (via `uv`/`pip`)
+or the AUR — they aren't packaged in `extra`/`core`.
+
+```bash
+# From the official repos:
+paru -S wtype portaudio python-pyqt5 python-numpy python-scipy \
+        python-huggingface-hub python-evdev
+
+# GPU only (skip on a CPU-only box):
+paru -S cuda cudnn
+```
+
+`sounddevice`, `faster-whisper`, `ctranslate2`, `tokenizers`, and `onnxruntime`
+are **not** in the official repos. Install them into the project's virtualenv
+with `uv sync` (recommended, see below), or from the AUR
+(`python-onnxruntime` / `python-onnxruntime-cpu`, etc.) if you prefer a global
+install — but `uv sync` is the tested path.
+
+### Python packages
+
+See `pyproject.toml`: `PyQt5`, `sounddevice`, `numpy`, `scipy`,
+`faster-whisper`, `onnxruntime`.
+
+```bash
+uv sync              # creates .venv and installs everything pinned in uv.lock
+```
 
 ## Run
 
 ```bash
-python wl_dictate.py             # tray app
-python wl_dictate.py --devices   # list microphones
-python wl_dictate.py --toggle    # toggle dictation (bind this to a key)
+uv run python wl_dictate.py             # tray app
+uv run python wl_dictate.py --devices   # list microphones
+uv run python wl_dictate.py --toggle    # toggle dictation (bind this to a key)
 ```
+
+(Drop the `uv run` prefix if you activated `.venv` yourself, or if you're
+running a bundled binary — then it's just `./dist/wl-dictate [--devices|--toggle]`.)
 
 ## Hyprland setup
 
 ```ini
-exec = python /path/to/wl-dictate/wl_dictate.py
-bind = CTRL ALT, f, exec, python /path/to/wl-dictate/wl_dictate.py --toggle
+# From source (via uv):
+exec = uv run --project /path/to/wl-dictate python /path/to/wl-dictate/wl_dictate.py
+bind = CTRL ALT, f, exec, uv run --project /path/to/wl-dictate python /path/to/wl-dictate/wl_dictate.py --toggle
+
+# Or, if you built the binary and copied it to /usr/local/bin:
+# exec = wl-dictate
+# bind = CTRL ALT, f, exec, wl-dictate --toggle
 ```
 
 The tray app also tries to repair/install the runtime `Ctrl+Alt+F` bind automatically when no conflicting bind exists. Existing binds pointing at `toggle_dictation.py` keep working.
@@ -112,6 +151,33 @@ uv run pytest        # or: .venv/bin/python -m pytest
 
 ## Build a single binary
 
+You don't actually need to freeze this into a binary — for a long-lived tray app
+the simplest, fastest-to-iterate distribution is just `uv sync` + a wrapper that
+runs `uv run python wl_dictate.py`. Bundling only helps if you want to ship a
+single self-contained file to a machine without the toolchain. When you do:
+
+**Recommended — PyInstaller** (fast build, fine startup for a persistent tray app):
+
 ```bash
-./build.sh           # Nuitka onefile build -> dist/wl-dictate
+paru -S python-pyinstaller     # or: uv pip install pyinstaller
+./build-pyinstaller.sh         # -> dist/wl-dictate
 ```
+
+PyInstaller bundles bytecode + shared libs, so the build finishes in ~a minute
+instead of the many minutes Nuitka spends compiling this ML stack to C. For a
+process that starts once and stays resident, its slightly slower cold start
+doesn't matter.
+
+**Alternative — Nuitka** (slow to build, produces a tighter/faster binary):
+
+```bash
+paru -S nuitka gcc             # nuitka is on the AUR
+./build.sh                     # -> dist/wl-dictate
+```
+
+Only reach for Nuitka if binary size / startup latency genuinely matter to you —
+the compile is *significantly* slower, especially the first time.
+
+> **GPU binaries:** neither freezer bundles the CUDA runtime itself. On the
+> target machine you still need `cuda`/`cudnn` installed (`paru -S cuda cudnn`)
+> for GPU decode; otherwise the binary runs CPU-only.
