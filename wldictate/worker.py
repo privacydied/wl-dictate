@@ -49,12 +49,22 @@ class _CaptureManager:
         self._persistent = persistent
         self._capture: AudioCapture | None = None
 
-    def acquire(self, device: int | None) -> AudioCapture:
-        if self._capture is not None:
-            if self._capture.device == device and self._capture.active:
+    def acquire(self, device: int | None, device_name: str | None = None) -> AudioCapture:
+        if self._capture is not None and self._capture.active:
+            # Identity is the device *name*: Pulse/PipeWire indices drift as
+            # streams appear/disappear, and reopening on a mere index change
+            # is exactly the USB renegotiation glitch this manager prevents.
+            current = self._capture.device_name
+            same = (
+                (device_name is not None and current == device_name)
+                or (device_name is None and self._capture.device == device)
+            )
+            if same:
                 self._capture.flush()
                 return self._capture
-            self._close()  # device changed or stream dead: reopen
+            self._close()  # genuinely different device: reopen
+        else:
+            self._close()
         capture = AudioCapture(device)
         capture.start()
         self._capture = capture
@@ -82,6 +92,7 @@ def _run_session(
     transcriber: FasterWhisperTranscriber,
     captures: _CaptureManager,
     device: int | None,
+    device_name: str | None,
     stop_event: threading.Event,
 ) -> None:
     emitter = make_emitter(cfg.typing.mode, wtype_timeout_s=cfg.typing.wtype_timeout_s)
@@ -114,7 +125,7 @@ def _run_session(
     )
 
     try:
-        capture = captures.acquire(device)
+        capture = captures.acquire(device, device_name)
         try:
             if capture.sample_rate_in != 16000:
                 _log(f"capturing at {capture.sample_rate_in} Hz (resampling to 16 kHz)")
@@ -191,7 +202,7 @@ def run() -> int:
             except ValueError:
                 pass
         try:
-            captures.acquire(device)
+            captures.acquire(device, cfg.input_device_name)
             _log("persistent capture pre-opened")
         except Exception as e:
             _log(f"capture pre-open failed (will retry on start): {e}")
@@ -242,10 +253,22 @@ def run() -> int:
             if _session_running():
                 _log("start ignored: session already active")
                 continue
+            # Re-resolve by name at start time: indices drift.
+            device = command.device
+            if command.device_name:
+                try:
+                    from .audio import resolve_device
+
+                    device = resolve_device(command.device_name)
+                except ValueError:
+                    _log(
+                        f"device {command.device_name!r} not found by name; "
+                        f"using index {device}"
+                    )
             stop_event.clear()
             session_thread = threading.Thread(
                 target=_run_session,
-                args=(cfg, transcriber, captures, command.device, stop_event),
+                args=(cfg, transcriber, captures, device, command.device_name, stop_event),
                 daemon=True,
                 name="audio-session",
             )

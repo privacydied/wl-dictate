@@ -31,6 +31,9 @@ VALID_EVENTS = ("ready", "listening", "stopped", "commit", "error", "log")
 class Command:
     cmd: str
     device: int | None = None
+    # Authoritative device identity: Pulse/PipeWire indices drift as streams
+    # appear/disappear, so the worker re-resolves by name at start time.
+    device_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,10 +43,14 @@ class Event:
     msg: str | None = None
 
 
-def format_command(cmd: str, device: int | None = None) -> str:
+def format_command(
+    cmd: str, device: int | None = None, device_name: str | None = None
+) -> str:
     payload: dict[str, Any] = {"cmd": cmd}
     if device is not None:
         payload["device"] = device
+    if device_name is not None:
+        payload["device_name"] = device_name
     return json.dumps(payload)
 
 
@@ -58,7 +65,10 @@ def parse_command(line: str) -> Command | None:
     device = obj.get("device")
     if device is not None and not isinstance(device, int):
         device = None
-    return Command(cmd=cmd, device=device)
+    device_name = obj.get("device_name")
+    if device_name is not None and not isinstance(device_name, str):
+        device_name = None
+    return Command(cmd=cmd, device=device, device_name=device_name)
 
 
 def format_event(ev: str, *, text: str | None = None, msg: str | None = None) -> str:

@@ -151,6 +151,7 @@ class AudioCapture:
         self._resampler = None
         self._pending = np.zeros(0, dtype=np.float32)
         self.sample_rate_in = SAMPLE_RATE
+        self.device_name: str | None = None
 
     # Rates to try, best first. The device default is appended at open time.
     _PREFERRED_RATES = (SAMPLE_RATE, 48000, 32000)
@@ -197,6 +198,10 @@ class AudioCapture:
             self._stream = stream
             self.sample_rate_in = int(stream.samplerate)
             self._resampler = _make_resampler(self.sample_rate_in)
+            try:
+                self.device_name = sd.query_devices(self._device, "input").get("name")
+            except Exception:
+                self.device_name = None
             return
         raise RuntimeError(f"could not open audio input: {last_error}")
 

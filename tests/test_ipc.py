@@ -25,6 +25,17 @@ def test_command_bad_device_dropped():
     assert cmd == ipc.Command("start", None)
 
 
+def test_command_device_name_roundtrip():
+    line = ipc.format_command("start", 17, "HD Pro Webcam C920 Analog Stereo")
+    cmd = ipc.parse_command(line)
+    assert cmd == ipc.Command("start", 17, "HD Pro Webcam C920 Analog Stereo")
+
+
+def test_command_bad_device_name_dropped():
+    cmd = ipc.parse_command('{"cmd": "start", "device": 3, "device_name": 42}')
+    assert cmd == ipc.Command("start", 3, None)
+
+
 def test_event_roundtrip():
     line = ipc.format_event("commit", text="hello world")
     ev = ipc.parse_event(line)

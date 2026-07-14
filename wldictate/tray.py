@@ -293,11 +293,15 @@ class DictationTrayApp:
         self._worker_monitor = _WorkerMonitor(self, self.worker_process)
         self._worker_monitor.start()
 
-    def _send_worker_command(self, cmd: str, device: int | None = None) -> None:
+    def _send_worker_command(
+        self, cmd: str, device: int | None = None, device_name: str | None = None
+    ) -> None:
         if not self.worker_process or self.worker_process.stdin is None:
             raise RuntimeError("dictation worker is not running")
         try:
-            self.worker_process.stdin.write(ipc.format_command(cmd, device) + "\n")
+            self.worker_process.stdin.write(
+                ipc.format_command(cmd, device, device_name) + "\n"
+            )
             self.worker_process.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             raise RuntimeError(f"dictation worker is not running ({e})") from e
@@ -498,7 +502,9 @@ class DictationTrayApp:
             was_ready = self._worker_ready
             self._ensure_worker_process()
             self._listening_notified = False
-            self._send_worker_command("start", device_idx)
+            self._send_worker_command(
+                "start", device_idx, device_info.get("name") if device_info else None
+            )
             self.is_dictating = True
             self.set_icon(True)
             if notice:
