@@ -94,6 +94,17 @@ class TypingConfig:
 
 
 @dataclass
+class AudioConfig:
+    # Keep the microphone stream open across dictation toggles. Opening and
+    # closing a USB mic renegotiates isochronous bandwidth on its USB
+    # controller, which audibly disrupts *other* audio devices on the same
+    # controller. Persistent capture negotiates once and never again (frames
+    # are discarded while dictation is off). Set false to fully release the
+    # mic whenever dictation is off.
+    persistent_capture: bool = True
+
+
+@dataclass
 class Config:
     model: str = "distil-small.en"
     device: str = "auto"  # auto | cuda | cpu
@@ -102,13 +113,19 @@ class Config:
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     typing: TypingConfig = field(default_factory=TypingConfig)
+    audio: AudioConfig = field(default_factory=AudioConfig)
 
     # Populated by load(); not serialized.
     warnings: list[str] = field(default_factory=list, repr=False)
 
     # ── (De)serialization ────────────────────────────────────────────────
 
-    _NESTED = {"streaming": StreamingConfig, "vad": VadConfig, "typing": TypingConfig}
+    _NESTED = {
+        "streaming": StreamingConfig,
+        "vad": VadConfig,
+        "typing": TypingConfig,
+        "audio": AudioConfig,
+    }
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {

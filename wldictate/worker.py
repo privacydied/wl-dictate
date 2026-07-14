@@ -34,10 +34,54 @@ def _log(msg: str) -> None:
     _emit("log", msg=msg)
 
 
+class _CaptureManager:
+    """Owns the AudioCapture; in persistent mode the mic stream stays open
+    across dictation toggles.
+
+    Rationale: opening/closing a USB microphone renegotiates isochronous
+    bandwidth on its USB controller, audibly glitching other audio devices on
+    the same controller (e.g. a USB output interface). Persistent capture
+    pays that cost once. Idle audio is discarded by the bounded queue and
+    flushed on session start.
+    """
+
+    def __init__(self, persistent: bool) -> None:
+        self._persistent = persistent
+        self._capture: AudioCapture | None = None
+
+    def acquire(self, device: int | None) -> AudioCapture:
+        if self._capture is not None:
+            if self._capture.device == device and self._capture.active:
+                self._capture.flush()
+                return self._capture
+            self._close()  # device changed or stream dead: reopen
+        capture = AudioCapture(device)
+        capture.start()
+        self._capture = capture
+        return capture
+
+    def release(self) -> None:
+        if not self._persistent:
+            self._close()
+
+    def invalidate(self) -> None:
+        """Session hit an audio error: force a clean reopen next time."""
+        self._close()
+
+    def _close(self) -> None:
+        if self._capture is not None:
+            self._capture.stop()
+            self._capture = None
+
+    def shutdown(self) -> None:
+        self._close()
+
+
 def _run_session(
     cfg: Config,
     transcriber: FasterWhisperTranscriber,
     formatter: TextFormatter,
+    captures: _CaptureManager,
     device: int | None,
     stop_event: threading.Event,
 ) -> None:
@@ -65,7 +109,8 @@ def _run_session(
     )
 
     try:
-        with AudioCapture(device) as capture:
+        capture = captures.acquire(device)
+        try:
             if capture.sample_rate_in != 16000:
                 _log(f"capturing at {capture.sample_rate_in} Hz (resampling to 16 kHz)")
             _emit("listening")
@@ -91,6 +136,10 @@ def _run_session(
             flush = gate.flush()
             if flush.utterance_ended:
                 session.finalize()
+            captures.release()
+        except Exception:
+            captures.invalidate()
+            raise
     except Exception as e:
         _emit("error", msg=f"session failed: {e}")
     finally:
@@ -124,6 +173,15 @@ def run() -> int:
     _emit("ready")
 
     formatter = TextFormatter()  # worker-lifetime: spacing survives toggles
+    captures = _CaptureManager(persistent=cfg.audio.persistent_capture)
+    if cfg.audio.persistent_capture:
+        # Pre-open the mic now: the one-time USB isochronous bandwidth
+        # negotiation happens at boot, not mid-playback on the first toggle.
+        try:
+            captures.acquire(cfg.input_device)
+            _log("persistent capture pre-opened")
+        except Exception as e:
+            _log(f"capture pre-open failed (will retry on start): {e}")
 
     commands: Queue[ipc.Command | None] = Queue()
 
@@ -174,13 +232,14 @@ def run() -> int:
             stop_event.clear()
             session_thread = threading.Thread(
                 target=_run_session,
-                args=(cfg, transcriber, formatter, command.device, stop_event),
+                args=(cfg, transcriber, formatter, captures, command.device, stop_event),
                 daemon=True,
                 name="audio-session",
             )
             session_thread.start()
 
     _stop_session()
+    captures.shutdown()
     _log("worker exiting")
     return 0
 

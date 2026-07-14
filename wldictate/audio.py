@@ -216,11 +216,29 @@ class AudioCapture:
     def __exit__(self, *exc) -> None:
         self.stop()
 
+    @property
+    def active(self) -> bool:
+        return self._stream is not None
+
+    @property
+    def device(self) -> int | None:
+        return self._device
+
     def take_dropped(self) -> int:
         """Return and reset the dropped-chunk counter."""
         with self._drop_lock:
             n, self._dropped = self._dropped, 0
             return n
+
+    def flush(self) -> None:
+        """Discard buffered audio (stale frames from an idle persistent stream)."""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._pending = np.zeros(0, dtype=np.float32)
+        self.take_dropped()
 
     def get_frames(self, timeout: float = 0.1) -> Iterator[np.ndarray]:
         """Wait up to ``timeout`` for audio; yield complete 512-sample frames."""
