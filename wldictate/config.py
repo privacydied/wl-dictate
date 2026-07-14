@@ -94,6 +94,9 @@ class TypingConfig:
     # Type a single trailing space after sentence-final punctuation when an
     # utterance ends, so manual typing can continue naturally.
     sentence_trailing_space: bool = True
+    # Capitalize the first letter of each sentence (utterance start and after
+    # . ! ?). Whisper often lowercases the word after a pause.
+    capitalize_sentences: bool = True
 
 
 @dataclass
@@ -109,7 +112,7 @@ class AudioConfig:
 
 @dataclass
 class Config:
-    model: str = "distil-small.en"
+    model: str = "small.en"
     device: str = "auto"  # auto | cuda | cpu
     compute_type: str = "auto"  # auto -> float16 on cuda, int8 on cpu
     # Device indices shift as PulseAudio/PipeWire streams appear/disappear, so

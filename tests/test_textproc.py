@@ -20,15 +20,20 @@ def test_clean_strips_leading_punct_only_at_utterance_start():
     assert clean_text(", hello", utterance_start=False) == ", hello"
 
 
+# The spacing/annotation tests below isolate separator behavior, so they turn
+# capitalization off to keep expectations about casing out of scope. Sentence
+# capitalization has its own tests further down.
+
+
 def test_formatter_spaces_across_commits():
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" the quick") == "the quick"
     assert f.format_delta(" brown fox") == " brown fox"
 
 
 def test_formatter_no_space_before_punctuation():
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" hello") == "hello"
     # A delta that begins with punctuation continues the previous word.
@@ -44,7 +49,7 @@ def test_formatter_spaces_across_utterances():
 
 
 def test_formatter_empty_after_cleanup():
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" (coughs) ") == ""
     # Nothing emitted yet, so the next real text needs no leading space.
@@ -52,7 +57,7 @@ def test_formatter_empty_after_cleanup():
 
 
 def test_formatter_annotation_only_first_commit_keeps_leading_strip():
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" [door slams] , yes") == "yes"
 
@@ -71,7 +76,7 @@ def test_word_tokens_never_glued_across_commits():
     # space upstream. In the streaming path every delta is a complete whisper
     # word token, so a missing leading space means a dropped separator, not a
     # mid-word continuation. Favor separating: gluing produced "thissucks".
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" some") == "some"
     assert f.format_delta("times") == " times"  # -> "some times", not "sometimes"
@@ -91,7 +96,7 @@ def test_dropped_leading_space_still_separates_words():
 
 def test_word_glued_onto_sentence_punctuation_separates():
     # "talk." + "And" (no leading space) must become "talk. And", not "talk.And".
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" talk.") == "talk."
     assert f.format_delta("And") == " And"
@@ -99,23 +104,62 @@ def test_word_glued_onto_sentence_punctuation_separates():
 
 def test_attached_punctuation_still_glues():
     # The separator safety net must NOT split attached punctuation.
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" hello") == "hello"
     assert f.format_delta(",") == ","  # -> "hello,"
     assert f.format_delta(" world") == " world"
     # contraction / possessive tails stay glued
-    g = TextFormatter()
+    g = TextFormatter(capitalize_sentences=False)
     g.on_utterance_start()
     assert g.format_delta(" it") == "it"
     assert g.format_delta("'s") == "'s"  # -> "it's"
 
 
 def test_opening_quote_gets_separator():
-    f = TextFormatter()
+    f = TextFormatter(capitalize_sentences=False)
     f.on_utterance_start()
     assert f.format_delta(" he said") == "he said"
     assert f.format_delta(' "stop') == ' "stop'
+
+
+def test_capitalizes_session_start():
+    f = TextFormatter()
+    f.on_utterance_start()
+    assert f.format_delta(" hello there") == "Hello there"
+
+
+def test_capitalizes_after_sentence_end():
+    # Whisper lowercases the word after a pause; we fix it. "talk. and" -> "And".
+    f = TextFormatter()
+    f.on_utterance_start()
+    out = "".join(f.format_delta(t) for t in [" all done.", " and then more"])
+    assert out == "All done. And then more"
+
+
+def test_capitalizes_across_utterance_pause():
+    f = TextFormatter()
+    f.on_utterance_start()
+    assert f.format_delta(" talk.") == "Talk."
+    # end_utterance emits the trailing space, so the next delta is already
+    # separated; it must still be capitalized (new sentence after the pause).
+    assert f.end_utterance() == " "
+    f.on_utterance_start()
+    assert f.format_delta(" and then") == "And then"
+
+
+def test_does_not_capitalize_mid_sentence():
+    f = TextFormatter()
+    f.on_utterance_start()
+    assert f.format_delta(" the quick") == "The quick"
+    assert f.format_delta(" brown fox") == " brown fox"  # 'brown' stays lowercase
+
+
+def test_capitalize_can_be_disabled():
+    f = TextFormatter(capitalize_sentences=False)
+    f.on_utterance_start()
+    out = "".join(f.format_delta(t) for t in [" all done.", " and more"])
+    assert out == "all done. and more"
 
 
 def test_trailing_space_after_sentence_end():
@@ -163,8 +207,9 @@ def test_trailing_space_configurable():
 
 def test_never_double_spaces_across_any_boundary():
     # Property-style: arbitrary utterance/commit patterns never produce "  "
-    # or a space-leading session.
-    f = TextFormatter()
+    # or a space-leading session. Capitalization off so the exact-string check
+    # stays about spacing.
+    f = TextFormatter(capitalize_sentences=False)
     out = ""
     for utterance in [[" One."], [" two,", " three!"], ["(cough)"], [" four"], ["...", " five."]]:
         f.on_utterance_start()

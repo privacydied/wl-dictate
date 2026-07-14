@@ -38,6 +38,21 @@ _RE_ENDS_SENTENCE = re.compile(r"[.!?][\"'’)\]}]*$")
 _SPACE_AFTER = set(".,!?;:…")
 
 
+def _capitalize_first_alpha(text: str) -> str:
+    """Upper-case the first alphabetic character, leaving leading spaces/quotes.
+
+    " and then" -> " And then";  '"stop' -> '"Stop';  "42 apples" left as-is
+    (leading char is a digit, not alphabetic — nothing to capitalize until a
+    letter, so we uppercase the first letter we find).
+    """
+    for i, ch in enumerate(text):
+        if ch.isalpha():
+            if ch.upper() == ch:
+                return text  # already capital (or non-cased script)
+            return text[:i] + ch.upper() + text[i + 1 :]
+    return text
+
+
 def _joins_words(prev: str, curr: str) -> bool:
     """Would placing ``curr`` right after ``prev`` fuse two separate words?
 
@@ -84,8 +99,14 @@ class TextFormatter:
     across toggles (the cursor may have moved anywhere in between).
     """
 
-    def __init__(self, *, sentence_trailing_space: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        sentence_trailing_space: bool = True,
+        capitalize_sentences: bool = True,
+    ) -> None:
         self._sentence_trailing_space = sentence_trailing_space
+        self._capitalize = capitalize_sentences
         self._tail: str = ""  # last few emitted chars; "" = nothing emitted yet
         self._utterance_has_output = False
 
@@ -133,9 +154,25 @@ class TextFormatter:
         if needs_separator:
             text = f" {text}"
 
+        if self._capitalize and self._at_sentence_start():
+            text = _capitalize_first_alpha(text)
+
         self._utterance_has_output = True
         self._tail = (self._tail + text)[-8:]
         return text
+
+    def _at_sentence_start(self) -> bool:
+        """True when the next word begins a sentence.
+
+        That's either the very first output of the session, or a point where the
+        emitted tail ends with sentence-final punctuation (optionally followed by
+        whitespace / closing quotes). Whisper often lowercases the word after a
+        pause ("... talk. and then ..."), so we fix the casing here.
+        """
+        tail = self._tail.rstrip()
+        if not tail:
+            return True
+        return bool(_RE_ENDS_SENTENCE.search(tail))
 
     def end_utterance(self) -> str:
         """Trailing output for a finished utterance ("" or a single space).

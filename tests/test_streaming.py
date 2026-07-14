@@ -33,7 +33,9 @@ class Harness:
         kw.update(session_kw)
         self.session = StreamingSession(
             self.fake,
-            TextFormatter(),
+            # Capitalization off: these tests assert on the lowercase fixture
+            # words to exercise agreement/commit/trim logic, not casing.
+            TextFormatter(capitalize_sentences=False),
             self.emitter,
             on_commit=self.commits.append,
             clock=lambda: self.t,

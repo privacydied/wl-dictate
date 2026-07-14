@@ -100,7 +100,8 @@ def _run_session(
     # toggles, so spacing context must never leak across sessions (a stale
     # "needs a space" flag typed leading spaces into new text fields).
     formatter = TextFormatter(
-        sentence_trailing_space=cfg.typing.sentence_trailing_space
+        sentence_trailing_space=cfg.typing.sentence_trailing_space,
+        capitalize_sentences=cfg.typing.capitalize_sentences,
     )
     gate = VadGate(
         make_vad(cfg.vad.backend),

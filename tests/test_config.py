@@ -7,7 +7,7 @@ from wldictate.config import Config
 
 def test_defaults():
     cfg = Config()
-    assert cfg.model == "distil-small.en"
+    assert cfg.model == "small.en"
     assert cfg.streaming.enabled is True
     assert cfg.vad.min_silence_ms == 500
 
@@ -49,7 +49,7 @@ def test_from_dict_unknown_keys_warn():
 
 def test_from_dict_bad_types_keep_defaults():
     cfg = Config.from_dict({"model": 5, "streaming": {"infer_interval_s": "fast"}})
-    assert cfg.model == "distil-small.en"
+    assert cfg.model == "small.en"
     assert cfg.streaming.infer_interval_s == 0.5
     assert len(cfg.warnings) == 2
 
@@ -80,7 +80,7 @@ def test_legacy_migration(tmp_path, monkeypatch):
     # Migrated file written to the XDG location.
     written = json.loads((tmp_path / "xdg" / "wl-dictate" / "config.json").read_text())
     assert written["input_device"] == 26
-    assert written["model"] == "distil-small.en"
+    assert written["model"] == "small.en"
 
 
 def test_save_load_roundtrip(tmp_path, monkeypatch):
@@ -100,4 +100,4 @@ def test_corrupt_config_falls_back(tmp_path, monkeypatch):
     path.write_text("{not json")
     monkeypatch.setattr("wldictate.config._legacy_config_paths", lambda: [])
     cfg = Config.load()
-    assert cfg.model == "distil-small.en"
+    assert cfg.model == "small.en"
