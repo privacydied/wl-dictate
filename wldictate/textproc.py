@@ -33,6 +33,23 @@ _BINDS_LEFT = set(".,!?;:%'’\")]}…")
 # The delta ends a sentence (possibly inside closing quotes/brackets).
 _RE_ENDS_SENTENCE = re.compile(r"[.!?][\"'’)\]}]*$")
 
+# Punctuation after which a following letter/digit must be spaced off (a word
+# glued directly onto sentence-final punctuation, e.g. "talk.And").
+_SPACE_AFTER = set(".,!?;:…")
+
+
+def _joins_words(prev: str, curr: str) -> bool:
+    """Would placing ``curr`` right after ``prev`` fuse two separate words?
+
+    True when both sides are word-forming (letter/digit) — "talkAnd" — or when
+    ``prev`` is sentence/clause punctuation immediately followed by a
+    word-forming ``curr`` — "talk.And". Used as a defensive separator when
+    Whisper's leading-space hint on a delta was lost upstream.
+    """
+    if not curr.isalnum():
+        return False
+    return prev.isalnum() or prev in _SPACE_AFTER
+
 
 def clean_text(text: str, *, utterance_start: bool) -> str:
     """Normalize one chunk of raw transcript text."""
@@ -96,6 +113,19 @@ class TextFormatter:
             # New utterance whose first token lacks a leading space: separate
             # unless it begins with punctuation that attaches left.
             needs_separator = text[0] not in _BINDS_LEFT
+        elif not text[0].isspace() and text[0] not in _BINDS_LEFT and _joins_words(
+            self._tail[-1], text[0]
+        ):
+            # Safety net: the delta lacks a leading space (Whisper's hint was
+            # lost — common on fast speech / distil models, and across commit
+            # boundaries), but gluing here would fuse two words like
+            # "talk.And" or "thissucks". If the boundary sits between two
+            # word-forming characters (or right after sentence punctuation),
+            # force a separator regardless of the missing hint. Genuine
+            # continuation tokens ("times" after " some") don't cross a commit
+            # boundary in LocalAgreement streaming, so this can't wrongly split
+            # a real word.
+            needs_separator = True
         else:
             # Mid-utterance continuation token ("times" after " some") or
             # attached punctuation (", world"): glue it on.
