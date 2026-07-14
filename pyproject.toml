@@ -1,0 +1,25 @@
+[project]
+name = "wl-dictate"
+version = "1.0.0"
+description = "Low-latency realtime voice dictation for Linux Wayland/X11"
+requires-python = ">=3.13"
+dependencies = [
+    "PyQt5>=5.15",
+    "sounddevice>=0.5",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "faster-whisper>=1.2",
+    "onnxruntime>=1.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+package = false

@@ -14,18 +14,20 @@ python3 -m nuitka \
     --output-dir=dist \
     --include-data-file=mic-on.png=mic-on.png \
     --include-data-file=mic-off.png=mic-off.png \
-    --include-data-file=config.json=config.json \
     --enable-plugin=pyqt5 \
+    --include-package=wldictate \
     --include-module=faster_whisper \
     --include-module=ctranslate2 \
     --include-module=tokenizers \
     --include-module=huggingface_hub \
     --include-module=sounddevice \
     --include-module=numpy \
-    --include-module=evdev \
+    --include-module=scipy.signal \
+    --include-module=onnxruntime \
     --include-package=faster_whisper \
     --include-package-data=faster_whisper \
     --include-package-data=ctranslate2 \
+    --include-package-data=onnxruntime \
     --assume-yes-for-downloads \
     --noinclude-pytest-mode=nofollow \
     --noinclude-setuptools-mode=nofollow \

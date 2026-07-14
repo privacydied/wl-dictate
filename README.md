@@ -1,257 +1,115 @@
 # wl-dictate
 
-Low-latency voice dictation for Linux Wayland/X11.
+Realtime voice dictation for Linux Wayland/X11.
 
-It runs as a PyQt5 tray app, keeps a faster-whisper worker warm in the background, listens to your microphone with `sounddevice`, and types the cleaned transcript into the currently focused window with `wtype`.
+It runs as a PyQt5 tray app, keeps a faster-whisper worker warm in the background, listens to your microphone, and **types words into the focused window while you are still speaking** — text appears roughly a second behind your voice and is never rewritten.
 
 ![Hyprland tray example](example.jpg)
 
-Example tray appearance on Hyprland. `tray_app.py` The tray icon/menu (the literal microphone, fourth from the right) is the main control surface for starting dictation, switching microphones, and quitting the app.
+Example tray appearance on Hyprland. The tray icon/menu (the literal microphone, fourth from the right) is the main control surface for starting dictation, switching microphones, and quitting the app.
 
-## What it does
+## How the realtime streaming works
 
-- starts from a system tray icon
-- prewarms the speech model once so toggling dictation is fast after launch
-- records audio from the selected microphone
-- detects speech with a lightweight VAD loop
-- transcribes with `faster-whisper`
-- cleans up noisy transcript formatting before typing
-- types into the focused app with `wtype`
-- exposes a local Unix socket so external keybinds can toggle dictation
-- repairs/installs a Hyprland `Ctrl+Alt+F` runtime bind automatically when possible
+Whisper is not a streaming model, so the worker fakes it properly:
 
-## Project files
+1. Audio is captured at 16 kHz mono (with correct, stateful resampling when the hardware can't do 16 kHz natively).
+2. A streaming **Silero VAD** (the ONNX model bundled with faster-whisper, run frame-by-frame with persistent state) segments speech, with ~320 ms of pre-roll so word onsets are never clipped.
+3. While you speak, the current utterance buffer is re-decoded every ~0.5 s with word timestamps.
+4. **LocalAgreement-2**: words that two consecutive decodes agree on are *committed* — cleaned up, spaced correctly, and typed immediately via `wtype`. Committed text is append-only.
+5. When you pause, a final decode flushes the rest. Long utterances trim already-committed audio out of the buffer (the committed text is fed back as decoder context), so decode cost stays bounded no matter how long you talk.
 
-- `tray_app.py` — PyQt5 tray app, worker lifecycle, device menu, socket listener, Hyprland bind repair
-- `whisper_dictate.py` — warm worker, audio capture, VAD, transcription, transcript cleanup, typing
-- `toggle_dictation.py` — tiny CLI that sends `toggle` over the Unix socket
-- `hotkey_listener.py` — legacy raw-evdev listener for `Ctrl+Alt+F` when running with elevated input permissions
-- `mic-on.png` / `mic-off.png` — tray icons
-- `example.jpg` — screenshot of the tray on Hyprland
-- `utils/benchmark_latency.py` — benchmark helper for worker boot/start/stop timing
-- `docs/performance-audit-20260408-v1.md` — current performance audit and optimization plan
+Decodes run on a single background thread; if a decode is still in flight when the next tick arrives, the tick is skipped — natural backpressure, no queue growth.
+
+## Project layout
+
+- `wl_dictate.py` — unified entry point (tray / `--worker` / `--toggle` / `--devices`)
+- `wldictate/` — the package:
+  - `tray.py` — PyQt5 tray app, worker lifecycle + auto-restart, device menu, toggle socket
+  - `worker.py` — controlled worker: JSON commands in, JSON events out
+  - `audio.py` — 16 kHz capture, stateful resamplers, bounded queue
+  - `vad.py` — streaming Silero VAD + energy fallback + utterance gate
+  - `streaming.py` — LocalAgreement-2 streaming engine
+  - `transcriber.py` — faster-whisper backend behind a swappable interface
+  - `textproc.py` — incremental transcript cleanup and spacing
+  - `emitter.py` — wtype typing (plus stdout/null emitters for testing)
+  - `config.py` / `ipc.py` / `notify.py` / `toggle.py`
+- `toggle_dictation.py` — compat shim for existing keybinds (`wl_dictate.py --toggle` is equivalent)
+- `hotkey_listener.py` — legacy raw-evdev listener (off the main path)
+- `tests/` — unit tests (no GPU/mic needed)
+- `utils/benchmark_latency.py` — latency benchmark against the worker protocol
 
 ## Runtime architecture
 
-There are two long-lived processes in the normal tray workflow:
+Two long-lived processes:
 
-1. `tray_app.py`
-   - creates the tray icon and context menu
-   - loads/saves `config.json`
-   - listens on `.dictation.sock`
-   - prewarms the worker at startup
-   - sends `start`, `stop`, and `quit` commands to the worker
+1. **Tray app** (`wl_dictate.py`)
+   - tray icon + device menu, config in `~/.config/wl-dictate/config.json`
+   - toggle socket at `$XDG_RUNTIME_DIR/wl-dictate.sock` (same-user check via `SO_PEERCRED`)
+   - prewarms the worker at startup, **auto-restarts it with backoff if it dies**
+   - tees worker output to `~/.local/state/wl-dictate/worker.log`
+   - repairs/installs a Hyprland `Ctrl+Alt+F` runtime bind when possible
 
-2. `whisper_dictate.py --controlled`
-   - loads `faster-whisper` once
-   - waits for commands on stdin
-   - starts/stops audio sessions without reloading the model
-   - writes state lines like `Worker ready`, `Listening...`, and `Session stopped`
+2. **Worker** (`wl_dictate.py --worker`)
+   - loads faster-whisper once (default `distil-small.en`, CUDA float16, CPU int8 fallback) and warms it up
+   - JSON-lines protocol on stdin/stdout: `{"cmd": "start", "device": 3}` in, `{"ev": "commit", "text": "..."}` out
+   - streams transcription as described above
 
-That warm-worker design is what removes the big per-toggle startup penalty.
+## Configuration
+
+`~/.config/wl-dictate/config.json` (created on first run; a legacy `config.json` next to the binary is migrated automatically):
+
+```json
+{
+  "model": "distil-small.en",
+  "device": "auto",
+  "compute_type": "auto",
+  "input_device": null,
+  "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_new_audio_s": 0.3, "max_buffer_s": 12.0 },
+  "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
+  "typing": { "mode": "commit", "wtype_timeout_s": 10.0 }
+}
+```
+
+Useful knobs:
+
+- `model` — any faster-whisper model id (`tiny.en`, `base.en`, `small.en`, `distil-small.en`, …). Bigger models are still realtime on a decent GPU.
+- `streaming.enabled: false` — revert to type-after-you-pause batch behavior.
+- `vad.min_silence_ms` — how long a pause ends an utterance.
+- Invalid values fall back to defaults with a warning in the log; unknown keys are reported, never fatal.
+
+Environment overrides: `WL_DICTATE_EMIT=stdout|null` (debug/benchmark: print or discard instead of typing).
 
 ## Requirements
 
-System packages you need:
+System: `wtype`, `portaudio`, Python ≥ 3.13, optionally an NVIDIA GPU (CUDA) — CPU fallback works.
 
-- `wtype`
-- `portaudio` / `libportaudio2`
-- Python 3
+Python (see `pyproject.toml`): `PyQt5`, `sounddevice`, `numpy`, `scipy`, `faster-whisper`, `onnxruntime`.
 
-Python packages used by the code:
-
-- `PyQt5`
-- `sounddevice`
-- `numpy`
-- `faster-whisper`
-- `evdev` (legacy raw hotkey path)
-- `ctranslate2` via `faster-whisper`
-
-## Run the tray app
-
-Use the project venv if you have one:
+## Run
 
 ```bash
-python tray_app.py
+python wl_dictate.py             # tray app
+python wl_dictate.py --devices   # list microphones
+python wl_dictate.py --toggle    # toggle dictation (bind this to a key)
 ```
-
-Or from the repo directory:
-
-```bash
-python tray_app.py
-```
-
-When the tray app starts it:
-
-- opens the tray icon
-- creates the local control socket
-- prewarms the worker
-- starts showing `mic-off.png`
-- allows left-click toggle and right-click menu actions
 
 ## Hyprland setup
 
-The intended Wayland path is a compositor bind that triggers `toggle_dictation.py`.
-
-Hyprland example:
-
 ```ini
-exec = python /home/pry/wl-dictate/tray_app.py
-bind = CTRL ALT, f, exec, python /home/pry/wl-dictate/toggle_dictation.py
+exec = python /path/to/wl-dictate/wl_dictate.py
+bind = CTRL ALT, f, exec, python /path/to/wl-dictate/wl_dictate.py --toggle
 ```
 
-Notes:
+The tray app also tries to repair/install the runtime `Ctrl+Alt+F` bind automatically when no conflicting bind exists. Existing binds pointing at `toggle_dictation.py` keep working.
 
-- the tray app should be launched once per session
-- the bind talks to the tray app over the Unix socket
-- the tray app also tries to repair/install the runtime Hyprland bind automatically if there is no conflicting bind already using `Ctrl+Alt+F`
-
-## Manual toggle command
-
-If you just want to trigger dictation from a shell or another launcher:
+## Tests
 
 ```bash
-python toggle_dictation.py
+uv run pytest        # or: .venv/bin/python -m pytest
 ```
 
-That command does not transcribe anything by itself. It only asks the running tray app to toggle state.
-
-## Legacy raw hotkey listener
-
-`hotkey_listener.py` still exists, but it reads raw `/dev/input/event*` devices. That means it is not the normal Hyprland path.
-
-Run it only if you specifically want the raw-input mode and have the required device permissions:
+## Build a single binary
 
 ```bash
-sudo python hotkey_listener.py
+./build.sh           # Nuitka onefile build -> dist/wl-dictate
 ```
-
-## CLI worker mode
-
-You can still run the transcription worker directly:
-
-```bash
-python whisper_dictate.py
-python whisper_dictate.py 0
-python whisper_dictate.py "USB Microphone"
-```
-
-That bypasses the tray workflow and runs a direct dictation session.
-
-## Microphone selection
-
-The tray menu shows all input devices returned by `sounddevice.query_devices()`.
-
-Behavior:
-
-- your selected device index is saved in `config.json`
-- if the saved device disappears, the tray app falls back to the current default input device
-- if no working input device exists, dictation will not start
-
-Current `config.json` format:
-
-```json
-{"input_device": 2}
-```
-
-## Transcript cleanup behavior
-
-Before typing, the worker normalizes the transcript.
-
-Current cleanup includes:
-
-- removing bracketed and parenthesized noise like `[noise]` or `(music)`
-- trimming leading whitespace, including weird Unicode whitespace
-- collapsing repeated whitespace to a single space
-- normalizing ellipses
-- inserting missing spaces after sentence punctuation in cases like:
-  - `Testing.How are we doing today?One, two, three.`
-  - becomes `Testing. How are we doing today? One, two, three.`
-- preserving common numeric punctuation like decimals such as `3.14`
-
-## Performance notes
-
-Important current behavior from the codebase:
-
-- the worker is prewarmed at tray startup
-- dictation start now reuses the loaded model instead of spawning a fresh one each time
-- VAD block duration is `0.2s`
-- tray worker polling interval is `100ms`
-- debug logging is off by default
-- enable debug logs with:
-
-```bash
-WL_DICTATE_DEBUG=1 python tray_app.py
-```
-
-Latency benchmark helper:
-
-```bash
-python utils/benchmark_latency.py
-```
-
-## Wayland typing notes
-
-Typing depends on `wtype`, which needs a valid Wayland session environment.
-
-The worker caches:
-
-- `WAYLAND_DISPLAY`
-- `XDG_RUNTIME_DIR`
-
-If they are missing, the worker tries to guess them from the runtime directory.
-
-## Troubleshooting
-
-### Tray app starts but toggle does nothing
-
-Check:
-
-- the tray app is actually running
-- `.dictation.sock` exists in the project directory
-- your Hyprland bind points to the current repo path, not an old directory
-
-### `Ctrl+Alt+F` does nothing on Hyprland
-
-Check your live binds:
-
-```bash
-hyprctl -j binds | grep toggle_dictation.py
-```
-
-If the bind points at an old path, update it and reload Hyprland.
-
-### Dictation starts but nothing gets typed
-
-Check:
-
-- `wtype` is installed
-- a text field is focused
-- the worker has valid `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`
-
-### Dictation feels slow the first time after launching the tray
-
-The worker is loading the model during prewarm. After that, repeated toggles should be much faster.
-
-### Saved microphone broke after unplugging hardware
-
-The tray app validates the saved device. If it is gone, it falls back to the default input device and updates `config.json`.
-
-### CUDA fails
-
-If CUDA is unavailable, the worker falls back to CPU/int8 mode.
-
-## Development notes
-
-Useful checks:
-
-```bash
-python -m py_compile tray_app.py whisper_dictate.py toggle_dictation.py hotkey_listener.py utils/benchmark_latency.py
-python utils/benchmark_latency.py
-```
-
-## Summary
-
-Use the tray app for normal use.
-Use the Hyprland `Ctrl+Alt+F` bind to toggle it.
-Keep the tray app running so the warm worker stays loaded and dictation starts fast.

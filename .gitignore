@@ -4,3 +4,4 @@ whisper.cpp/
 *.log
 .venv/
 nuitka-crash-report.xml
+config.json
