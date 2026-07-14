@@ -100,6 +100,8 @@ def _run_session(
         wtype_timeout_s=cfg.typing.wtype_timeout_s,
         wtype_delay_ms=cfg.typing.wtype_delay_ms,
         wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
+        electron_workaround=cfg.typing.electron_workaround,
+        electron_classes=cfg.typing.electron_app_classes,
     )
     # Fresh formatter per session: the cursor may have moved anywhere between
     # toggles, so spacing context must never leak across sessions (a stale

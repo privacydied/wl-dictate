@@ -66,7 +66,7 @@ Two long-lived processes:
   "input_device": null,
   "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_new_audio_s": 0.3, "max_buffer_s": 12.0 },
   "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
-  "typing": { "mode": "commit", "wtype_timeout_s": 10.0, "wtype_delay_ms": 6, "sentence_trailing_space": true, "capitalize_sentences": true },
+  "typing": { "mode": "commit", "wtype_timeout_s": 10.0, "wtype_delay_ms": 6, "sentence_trailing_space": true, "capitalize_sentences": true, "electron_workaround": true },
   "audio": { "persistent_capture": true }
 }
 ```
@@ -78,11 +78,16 @@ Useful knobs:
 - `typing.capitalize_sentences` — capitalize the first letter of each sentence
   (utterance start and after `.`/`!`/`?`). Whisper often lowercases the word
   after a pause; default true. Set `false` to keep the model's raw casing.
-- `typing.wtype_delay_ms` — per-keystroke delay for `wtype` (default 6). Electron
-  /Chromium apps (Vesktop, Discord, VSCode, Slack) drop characters — usually
-  spaces and punctuation — when keystrokes arrive too fast; the delay paces them.
-  Raise it (e.g. 10–15) if an app still drops characters; set 0 for max speed on
-  native GTK/Qt fields.
+- `typing.wtype_delay_ms` — per-keystroke delay for `wtype` (default 6).
+  Set 0 for maximum speed if nothing drops characters.
+- `typing.electron_workaround` — Chromium/Electron apps (Vesktop, Discord,
+  Slack, …) eat leading **space** keys on every fresh `wtype` connection —
+  no delay fixes it — so dictated words fuse ("TestingTesting"). When the
+  focused window class matches `typing.electron_app_classes`, commits that
+  start with a space get an invisible zero-width-space prefix that "opens the
+  gate" so the real space lands. Default true; only ever applied to matching
+  apps, so terminals/editors never receive ZWSP characters. Add your app's
+  window class to `electron_app_classes` if another Electron app fuses words.
 - `vad.min_silence_ms` — how long a pause ends an utterance.
 - `audio.persistent_capture` — keep the mic stream open across toggles (default true). Opening/closing a USB mic renegotiates isochronous bandwidth on its USB controller, which can audibly glitch *other* audio devices on the same controller; persistent capture negotiates once. While dictation is off, captured audio is discarded immediately and never transcribed. Set `false` to fully release the mic on toggle-off.
 - Invalid values fall back to defaults with a warning in the log; unknown keys are reported, never fatal.

@@ -96,12 +96,32 @@ class TypingConfig:
     # punctuation — when keystrokes arrive too fast; a small delay fixes it.
     # 0 = no delay (fastest; fine for native GTK/Qt fields).
     wtype_delay_ms: int = 6
-    # Settle delay (ms) BEFORE the first keystroke of each wtype call, passed as
-    # `wtype -s`. Each commit is a separate wtype invocation, and Electron often
-    # drops the *first* keystroke of a fresh burst — which is the delta's leading
-    # space, so words fuse ("TestingTesting"). This pre-delay lets the target
-    # window be ready. 0 = disabled.
-    wtype_press_delay_ms: int = 40
+    # Settle delay (ms) BEFORE the first keystroke of each wtype call, passed
+    # as `wtype -s`. Empirically this does NOT fix Electron's leading-space
+    # drop (see electron_workaround below) — kept as a knob for other slow
+    # compositor paths. 0 = disabled.
+    wtype_press_delay_ms: int = 0
+    # Chromium/Electron apps drop leading SPACE keys on every fresh wtype
+    # connection (regardless of delays), fusing words: "TestingTesting".
+    # Workaround: when the focused window is one of electron_app_classes and
+    # the text starts with a space, prefix an invisible zero-width space
+    # (U+200B) — it "opens the gate" so the real space lands. Only applied to
+    # matching apps so terminals/editors never receive ZWSP junk.
+    electron_workaround: bool = True
+    electron_app_classes: list[str] = field(
+        default_factory=lambda: [
+            "vesktop",
+            "discord",
+            "webcord",
+            "legcord",
+            "chromium",
+            "chrome",
+            "electron",
+            "slack",
+            "element",
+            "signal",
+        ]
+    )
     # Type a single trailing space after sentence-final punctuation when an
     # utterance ends, so manual typing can continue naturally.
     sentence_trailing_space: bool = True
@@ -194,6 +214,10 @@ class Config:
                 value = float(value) if ok else value
             elif isinstance(current, str):
                 ok = isinstance(value, str)
+            elif isinstance(current, list):
+                ok = isinstance(value, list) and all(
+                    isinstance(item, str) for item in value
+                )
             else:
                 ok = False
             if ok:

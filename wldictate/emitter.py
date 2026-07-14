@@ -69,26 +69,80 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
 class WtypeEmitter(Emitter):
     """Types text into the focused window with wtype (append-only)."""
 
+    #: Invisible gate-opener for Electron's leading-space drop (see emit()).
+    _ZWSP = "​"
+
     def __init__(
         self,
         timeout_s: float = 10.0,
         delay_ms: int = 6,
-        press_delay_ms: int = 40,
+        press_delay_ms: int = 0,
+        electron_workaround: bool = True,
+        electron_classes: tuple[str, ...] | list[str] = (
+            "vesktop",
+            "discord",
+            "webcord",
+            "legcord",
+            "chromium",
+            "chrome",
+            "electron",
+            "slack",
+            "element",
+            "signal",
+        ),
     ) -> None:
         self._timeout = timeout_s
-        # Per-keystroke delay. Electron/Chromium apps drop characters (spaces,
-        # punctuation) when events arrive too fast; `wtype -d <ms>` paces them.
+        # Per-keystroke delay (`wtype -d`), paces bursts for slow consumers.
         self._delay_ms = max(0, int(delay_ms))
         # Settle delay before the first keystroke of each call (`wtype -s`).
-        # Electron drops the first keystroke of a fresh burst — usually the
-        # delta's leading space — fusing words; this gives the window time.
         self._press_delay_ms = max(0, int(press_delay_ms))
+        self._electron_workaround = electron_workaround
+        self._electron_classes = tuple(c.lower() for c in electron_classes)
         self._env = os.environ.copy()
         _guess_wayland_env(self._env)
+
+    def _focused_window_class(self) -> str:
+        """Window class of the focused window ("" if unknown / not Hyprland)."""
+        try:
+            result = subprocess.run(
+                ["hyprctl", "-j", "activewindow"],
+                env=self._env,
+                timeout=1.0,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                return ""
+            import json
+
+            data = json.loads(result.stdout)
+            return str(data.get("class") or data.get("initialClass") or "")
+        except Exception:
+            return ""
+
+    def _needs_electron_gate(self, text: str) -> bool:
+        """True when the leading space of ``text`` would be eaten by the
+        focused window.
+
+        Chromium/Electron apps drop SPACE keys at the start of every fresh
+        wtype connection — regardless of -s/-d delays — fusing dictated words
+        ("TestingTesting"). An invisible zero-width space typed first "opens
+        the gate" so the real space lands. Only applied when the focused
+        window class matches a known Electron app, so terminals and editors
+        never receive ZWSP characters.
+        """
+        if not self._electron_workaround or not text.startswith(" "):
+            return False
+        focused = self._focused_window_class().lower()
+        if not focused:
+            return False
+        return any(cls in focused for cls in self._electron_classes)
 
     def emit(self, text: str) -> bool:
         if not text:
             return True
+        if self._needs_electron_gate(text):
+            text = self._ZWSP + text
         # Pass text on stdin via wtype's "-" placeholder rather than as an
         # argv word: text that begins with "-" (e.g. a spoken dash) would
         # otherwise be misparsed as a flag ("Missing argument to -foo").
@@ -128,7 +182,9 @@ def make_emitter(
     *,
     wtype_timeout_s: float = 10.0,
     wtype_delay_ms: int = 6,
-    wtype_press_delay_ms: int = 40,
+    wtype_press_delay_ms: int = 0,
+    electron_workaround: bool = True,
+    electron_classes: tuple[str, ...] | list[str] | None = None,
 ) -> Emitter:
     """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null)."""
     override = os.environ.get("WL_DICTATE_EMIT", "").strip().lower()
@@ -137,8 +193,12 @@ def make_emitter(
         return NullEmitter()
     if choice == "stdout":
         return StdoutEmitter()
-    return WtypeEmitter(
+    kwargs: dict = dict(
         timeout_s=wtype_timeout_s,
         delay_ms=wtype_delay_ms,
         press_delay_ms=wtype_press_delay_ms,
+        electron_workaround=electron_workaround,
     )
+    if electron_classes is not None:
+        kwargs["electron_classes"] = electron_classes
+    return WtypeEmitter(**kwargs)
