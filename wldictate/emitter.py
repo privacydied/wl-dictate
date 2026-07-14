@@ -69,17 +69,28 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
 class WtypeEmitter(Emitter):
     """Types text into the focused window with wtype (append-only)."""
 
-    def __init__(self, timeout_s: float = 10.0) -> None:
+    def __init__(self, timeout_s: float = 10.0, delay_ms: int = 6) -> None:
         self._timeout = timeout_s
+        # Per-keystroke delay. Electron/Chromium apps drop characters (spaces,
+        # punctuation) when events arrive too fast; `wtype -d <ms>` paces them.
+        self._delay_ms = max(0, int(delay_ms))
         self._env = os.environ.copy()
         _guess_wayland_env(self._env)
 
     def emit(self, text: str) -> bool:
         if not text:
             return True
+        # Pass text on stdin via wtype's "-" placeholder rather than as an
+        # argv word: text that begins with "-" (e.g. a spoken dash) would
+        # otherwise be misparsed as a flag ("Missing argument to -foo").
+        cmd = ["wtype"]
+        if self._delay_ms > 0:
+            cmd += ["-d", str(self._delay_ms)]
+        cmd.append("-")
         try:
             result = subprocess.run(
-                ["wtype", text],
+                cmd,
+                input=text,
                 env=self._env,
                 timeout=self._timeout,
                 capture_output=True,
@@ -101,7 +112,9 @@ class WtypeEmitter(Emitter):
         return True
 
 
-def make_emitter(mode: str, *, wtype_timeout_s: float = 10.0) -> Emitter:
+def make_emitter(
+    mode: str, *, wtype_timeout_s: float = 10.0, wtype_delay_ms: int = 6
+) -> Emitter:
     """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null)."""
     override = os.environ.get("WL_DICTATE_EMIT", "").strip().lower()
     choice = override or mode
@@ -109,4 +122,4 @@ def make_emitter(mode: str, *, wtype_timeout_s: float = 10.0) -> Emitter:
         return NullEmitter()
     if choice == "stdout":
         return StdoutEmitter()
-    return WtypeEmitter(timeout_s=wtype_timeout_s)
+    return WtypeEmitter(timeout_s=wtype_timeout_s, delay_ms=wtype_delay_ms)

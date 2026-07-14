@@ -50,7 +50,7 @@ Two long-lived processes:
    - repairs/installs a Hyprland `Ctrl+Alt+F` runtime bind when possible
 
 2. **Worker** (`wl_dictate.py --worker`)
-   - loads faster-whisper once (default `distil-small.en`, CUDA float16, CPU int8 fallback) and warms it up
+   - loads faster-whisper once (default `small.en`, CUDA float16, CPU int8 fallback) and warms it up
    - JSON-lines protocol on stdin/stdout: `{"cmd": "start", "device": 3}` in, `{"ev": "commit", "text": "..."}` out
    - streams transcription as described above
 
@@ -60,13 +60,13 @@ Two long-lived processes:
 
 ```json
 {
-  "model": "distil-small.en",
+  "model": "small.en",
   "device": "auto",
   "compute_type": "auto",
   "input_device": null,
   "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_new_audio_s": 0.3, "max_buffer_s": 12.0 },
   "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
-  "typing": { "mode": "commit", "wtype_timeout_s": 10.0, "sentence_trailing_space": true },
+  "typing": { "mode": "commit", "wtype_timeout_s": 10.0, "wtype_delay_ms": 6, "sentence_trailing_space": true, "capitalize_sentences": true },
   "audio": { "persistent_capture": true }
 }
 ```
@@ -75,6 +75,14 @@ Useful knobs:
 
 - `model` — any faster-whisper model id (`tiny.en`, `base.en`, `small.en`, `distil-small.en`, …). Bigger models are still realtime on a decent GPU.
 - `streaming.enabled: false` — revert to type-after-you-pause batch behavior.
+- `typing.capitalize_sentences` — capitalize the first letter of each sentence
+  (utterance start and after `.`/`!`/`?`). Whisper often lowercases the word
+  after a pause; default true. Set `false` to keep the model's raw casing.
+- `typing.wtype_delay_ms` — per-keystroke delay for `wtype` (default 6). Electron
+  /Chromium apps (Vesktop, Discord, VSCode, Slack) drop characters — usually
+  spaces and punctuation — when keystrokes arrive too fast; the delay paces them.
+  Raise it (e.g. 10–15) if an app still drops characters; set 0 for max speed on
+  native GTK/Qt fields.
 - `vad.min_silence_ms` — how long a pause ends an utterance.
 - `audio.persistent_capture` — keep the mic stream open across toggles (default true). Opening/closing a USB mic renegotiates isochronous bandwidth on its USB controller, which can audibly glitch *other* audio devices on the same controller; persistent capture negotiates once. While dictation is off, captured audio is discarded immediately and never transcribed. Set `false` to fully release the mic on toggle-off.
 - Invalid values fall back to defaults with a warning in the log; unknown keys are reported, never fatal.
@@ -87,7 +95,7 @@ Environment overrides: `WL_DICTATE_EMIT=stdout|null` (debug/benchmark: print or 
 - **System:** `wtype` (types the text), `portaudio` (mic capture backend).
 - **GPU (optional):** an NVIDIA GPU with CUDA + cuDNN. Without it, the worker
   transparently falls back to CPU (`int8`), which is still realtime for the
-  `distil-small.en` default.
+  `small.en` default.
 
 ### Arch Linux (`paru`)
 
@@ -142,6 +150,38 @@ bind = CTRL ALT, f, exec, uv run --project /path/to/wl-dictate python /path/to/w
 ```
 
 The tray app also tries to repair/install the runtime `Ctrl+Alt+F` bind automatically when no conflicting bind exists. Existing binds pointing at `toggle_dictation.py` keep working.
+
+## Run as a service (recommended)
+
+`exec-once` in a compositor config only runs at session start — it won't relaunch
+the app after you kill it or reload the compositor. Run it as a **systemd user
+service** instead: it auto-restarts on crash *or* manual kill, and survives
+config reloads.
+
+A ready-made unit lives at [`systemd/wl-dictate.service`](systemd/wl-dictate.service).
+Assuming you cloned to `~/wl-dictate` (edit the `ExecStart` paths otherwise):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/wl-dictate.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wl-dictate.service
+
+# The tray needs the compositor's env (WAYLAND_DISPLAY etc.). If the service
+# can't find the display, import it once from your session:
+#   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
+```
+
+Then in your Hyprland config, replace the `exec-once` python line with an
+idempotent start (safe to re-run on every reload):
+
+```ini
+exec = systemctl --user start wl-dictate.service
+bind = CTRL ALT, f, exec, /path/to/wl-dictate/.venv/bin/python /path/to/wl-dictate/wl_dictate.py --toggle
+```
+
+Manage it with `systemctl --user {status,restart,stop} wl-dictate.service` and
+tail logs with `journalctl --user -u wl-dictate -f`.
 
 ## Tests
 

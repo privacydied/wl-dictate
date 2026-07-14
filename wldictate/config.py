@@ -91,6 +91,11 @@ class VadConfig:
 class TypingConfig:
     mode: str = "commit"  # commit (append-only); future: correcting
     wtype_timeout_s: float = 10.0
+    # Per-keystroke delay (ms) passed to `wtype -d`. Electron/Chromium apps
+    # (Vesktop, Discord, VSCode, Slack) drop characters — usually spaces and
+    # punctuation — when keystrokes arrive too fast; a small delay fixes it.
+    # 0 = no delay (fastest; fine for native GTK/Qt fields).
+    wtype_delay_ms: int = 6
     # Type a single trailing space after sentence-final punctuation when an
     # utterance ends, so manual typing can continue naturally.
     sentence_trailing_space: bool = True

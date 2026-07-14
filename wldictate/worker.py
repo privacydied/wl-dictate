@@ -95,7 +95,11 @@ def _run_session(
     device_name: str | None,
     stop_event: threading.Event,
 ) -> None:
-    emitter = make_emitter(cfg.typing.mode, wtype_timeout_s=cfg.typing.wtype_timeout_s)
+    emitter = make_emitter(
+        cfg.typing.mode,
+        wtype_timeout_s=cfg.typing.wtype_timeout_s,
+        wtype_delay_ms=cfg.typing.wtype_delay_ms,
+    )
     # Fresh formatter per session: the cursor may have moved anywhere between
     # toggles, so spacing context must never leak across sessions (a stale
     # "needs a space" flag typed leading spaces into new text fields).
