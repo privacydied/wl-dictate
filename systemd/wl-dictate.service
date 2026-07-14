@@ -1,0 +1,25 @@
+[Unit]
+Description=wl-dictate realtime voice dictation tray
+Documentation=https://github.com/privacydied/wl-dictate
+# Start once the graphical (Wayland) session is up, so the tray can attach and
+# wtype can reach the compositor.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# EDIT THIS PATH to where you cloned the repo. The .venv is the one created by
+# `uv sync`; its python is what the app must run under.
+#
+#   systemctl --user edit wl-dictate.service   # to override without touching this file
+#
+ExecStart=%h/wl-dictate/.venv/bin/python %h/wl-dictate/wl_dictate.py
+# Always come back — on a crash AND after a manual kill / clean exit. Killing
+# the app and reloading the compositor should never leave you without dictation.
+Restart=always
+RestartSec=2
+# The tray needs the compositor's environment. `systemctl --user import-environment`
+# (see README) makes WAYLAND_DISPLAY / XDG_RUNTIME_DIR available to the unit.
+
+[Install]
+WantedBy=graphical-session.target
