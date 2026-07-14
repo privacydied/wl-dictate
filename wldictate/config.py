@@ -91,6 +91,9 @@ class VadConfig:
 class TypingConfig:
     mode: str = "commit"  # commit (append-only); future: correcting
     wtype_timeout_s: float = 10.0
+    # Type a single trailing space after sentence-final punctuation when an
+    # utterance ends, so manual typing can continue naturally.
+    sentence_trailing_space: bool = True
 
 
 @dataclass
@@ -109,7 +112,10 @@ class Config:
     model: str = "distil-small.en"
     device: str = "auto"  # auto | cuda | cpu
     compute_type: str = "auto"  # auto -> float16 on cuda, int8 on cpu
+    # Device indices shift as PulseAudio/PipeWire streams appear/disappear, so
+    # the name is authoritative; the index is a hint from the last resolution.
     input_device: int | None = None
+    input_device_name: str | None = None
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     typing: TypingConfig = field(default_factory=TypingConfig)
@@ -133,6 +139,7 @@ class Config:
             "device": self.device,
             "compute_type": self.compute_type,
             "input_device": self.input_device,
+            "input_device_name": self.input_device_name,
         }
         for name in self._NESTED:
             out[name] = dict(vars(getattr(self, name)))
@@ -151,10 +158,16 @@ class Config:
                 cfg.warnings.append(f"unknown config key ignored: {path}")
                 return
             current = getattr(obj, key)
-            # Optional[int] field (input_device)
+            # Optional fields
             if key == "input_device":
                 if value is None or isinstance(value, int):
                     obj.input_device = value
+                else:
+                    cfg.warnings.append(f"invalid value for {path}; keeping default")
+                return
+            if key == "input_device_name":
+                if value is None or isinstance(value, str):
+                    obj.input_device_name = value
                 else:
                     cfg.warnings.append(f"invalid value for {path}; keeping default")
                 return

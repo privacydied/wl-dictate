@@ -414,9 +414,27 @@ class DictationTrayApp:
     def _resolve_start_device(self):
         import sounddevice as sd
 
-        device_info = self._get_input_device_info(self.config.input_device)
+        # The saved *name* is authoritative: Pulse/PipeWire device indices
+        # shift as streams appear and disappear, so a bare index can silently
+        # point at a different microphone (or nothing) between sessions.
+        idx = self.config.input_device
+        name = self.config.input_device_name
+        device_info = self._get_input_device_info(idx)
+        if name and (device_info is None or device_info.get("name") != name):
+            from .audio import resolve_device
+
+            try:
+                idx = resolve_device(name)
+                device_info = self._get_input_device_info(idx)
+            except Exception:
+                device_info = None
         if device_info is not None:
-            return self.config.input_device, device_info, None
+            if idx != self.config.input_device or not name:
+                self.config.input_device = idx
+                self.config.input_device_name = device_info.get("name")
+                self._save_config()
+            return idx, device_info, None
+
         try:
             default_input, _ = sd.default.device
         except Exception:
@@ -424,9 +442,11 @@ class DictationTrayApp:
         default_info = self._get_input_device_info(default_input)
         if default_info is None:
             self.config.input_device = None
+            self.config.input_device_name = None
             self._save_config()
             return None, None, "No working input device is available."
         self.config.input_device = int(default_input)
+        self.config.input_device_name = default_info.get("name")
         self._save_config()
         return (
             self.config.input_device,
@@ -440,6 +460,7 @@ class DictationTrayApp:
             notify(f"Input device {device_idx} is unavailable")
             return
         self.config.input_device = device_idx
+        self.config.input_device_name = device_info.get("name")
         self._save_config()
         self.set_icon(self.is_dictating)
         notify(f"Input device set to: {device_info.get('name', device_idx)}")

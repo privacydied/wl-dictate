@@ -155,6 +155,9 @@ class StreamingSession:
         tail = words[len(self._committed) :]
         if tail:
             self._commit_words(tail)
+        trailer = self._formatter.end_utterance()
+        if trailer and not self._emitter.emit(trailer):
+            self._error("emitter failed to type utterance trailer")
         self._reset_utterance_state()
 
     def stop(self) -> None:

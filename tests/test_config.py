@@ -12,6 +12,19 @@ def test_defaults():
     assert cfg.vad.min_silence_ms == 500
 
 
+def test_input_device_name_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfg = Config()
+    cfg.input_device = 26
+    cfg.input_device_name = "HD Pro Webcam C920 Analog Stereo"
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.input_device == 26
+    assert loaded.input_device_name == "HD Pro Webcam C920 Analog Stereo"
+    bad = Config.from_dict({"input_device_name": 42})
+    assert bad.input_device_name is None and bad.warnings
+
+
 def test_from_dict_valid():
     cfg = Config.from_dict(
         {

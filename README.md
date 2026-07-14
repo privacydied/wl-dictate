@@ -66,7 +66,7 @@ Two long-lived processes:
   "input_device": null,
   "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_new_audio_s": 0.3, "max_buffer_s": 12.0 },
   "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
-  "typing": { "mode": "commit", "wtype_timeout_s": 10.0 },
+  "typing": { "mode": "commit", "wtype_timeout_s": 10.0, "sentence_trailing_space": true },
   "audio": { "persistent_capture": true }
 }
 ```

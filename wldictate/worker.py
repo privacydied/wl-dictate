@@ -80,12 +80,17 @@ class _CaptureManager:
 def _run_session(
     cfg: Config,
     transcriber: FasterWhisperTranscriber,
-    formatter: TextFormatter,
     captures: _CaptureManager,
     device: int | None,
     stop_event: threading.Event,
 ) -> None:
     emitter = make_emitter(cfg.typing.mode, wtype_timeout_s=cfg.typing.wtype_timeout_s)
+    # Fresh formatter per session: the cursor may have moved anywhere between
+    # toggles, so spacing context must never leak across sessions (a stale
+    # "needs a space" flag typed leading spaces into new text fields).
+    formatter = TextFormatter(
+        sentence_trailing_space=cfg.typing.sentence_trailing_space
+    )
     gate = VadGate(
         make_vad(cfg.vad.backend),
         onset=cfg.vad.onset,
@@ -172,13 +177,21 @@ def run() -> int:
     )
     _emit("ready")
 
-    formatter = TextFormatter()  # worker-lifetime: spacing survives toggles
     captures = _CaptureManager(persistent=cfg.audio.persistent_capture)
     if cfg.audio.persistent_capture:
         # Pre-open the mic now: the one-time USB isochronous bandwidth
         # negotiation happens at boot, not mid-playback on the first toggle.
+        # Resolve by name — saved indices go stale as Pulse devices shift.
+        device = cfg.input_device
+        if cfg.input_device_name:
+            try:
+                from .audio import resolve_device
+
+                device = resolve_device(cfg.input_device_name)
+            except ValueError:
+                pass
         try:
-            captures.acquire(cfg.input_device)
+            captures.acquire(device)
             _log("persistent capture pre-opened")
         except Exception as e:
             _log(f"capture pre-open failed (will retry on start): {e}")
@@ -232,7 +245,7 @@ def run() -> int:
             stop_event.clear()
             session_thread = threading.Thread(
                 target=_run_session,
-                args=(cfg, transcriber, formatter, captures, command.device, stop_event),
+                args=(cfg, transcriber, captures, command.device, stop_event),
                 daemon=True,
                 name="audio-session",
             )
