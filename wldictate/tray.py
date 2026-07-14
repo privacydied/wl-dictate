@@ -222,7 +222,6 @@ class DictationTrayApp:
         except Exception:
             return
 
-        matching_bind = None
         conflicting_bind = None
         for bind in binds:
             if bind.get("key", "").lower() != "f":
@@ -230,28 +229,23 @@ class DictationTrayApp:
             if bind.get("modmask") != 12:
                 continue
             arg = bind.get("arg", "")
+            # Any Ctrl+Alt+F bind that already toggles dictation is good enough,
+            # regardless of the exact interpreter path ("python" vs "python3")
+            # or entry point. Installing our own on top produces a DUPLICATE
+            # bind, so every keypress fires twice (start immediately followed by
+            # stop). Leave an existing toggle bind untouched.
             if "toggle_dictation" in arg or "--toggle" in arg:
-                matching_bind = bind
-                if toggle_command in arg:
-                    return
-            else:
-                conflicting_bind = bind
+                return
+            conflicting_bind = bind
 
         if conflicting_bind is not None:
             return
-        if matching_bind is not None:
-            self._run_hyprctl("keyword", "unbind", "CTRL ALT, F")
         bind_result = self._run_hyprctl(
             "keyword", "bind", f"CTRL ALT, F, exec, {toggle_command}"
         )
         if bind_result.returncode != 0:
             return
-        message = (
-            "Repaired Hyprland Ctrl+Alt+F dictation toggle"
-            if matching_bind is not None
-            else "Installed Hyprland Ctrl+Alt+F dictation toggle"
-        )
-        notify(message)
+        notify("Installed Hyprland Ctrl+Alt+F dictation toggle")
 
     # ── Worker lifecycle ─────────────────────────────────────────────────
 
