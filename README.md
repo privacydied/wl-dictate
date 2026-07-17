@@ -57,21 +57,74 @@ Two long-lived processes:
 
 ## Contextual dictation (Ctrl+Alt+D)
 
-A second dictation mode inspired by heyclicky-style contextual dictation. You speak; raw words appear instantly and self-correct exactly like standard dictation — then, when you pause, the whole utterance is **rewritten in place by an LLM** that sees lightweight screen context: the focused window's class and title, the primary selection, and the clipboard (text only — no screenshots).
+A second dictation mode inspired by heyclicky-style contextual dictation. You speak; raw words appear instantly and self-correct exactly like standard dictation — then, when you pause, the whole utterance is **rewritten in place by an LLM that sees your screen**.
 
-- Plain dictation gets cleaned up (grammar, punctuation) in the register of the focused app — terse in a terminal, casual in Discord, prose in email.
-- Spoken **instructions about text are executed**, not transcribed: select a message and say "reply to this saying I can't make it tonight" and the reply is what gets typed.
-- If the LLM is down, slow, or misconfigured, **you lose nothing**: the dictated text is already on screen and simply stays.
+### What it can do
 
-Three endpoint profiles ship in `contextual.profiles`; switching is the single `contextual.profile` field:
+| you say | what happens |
+|---|---|
+| plain speech | cleaned up (grammar, punctuation, mishears) in the app's register — terse in a terminal, casual in Discord, prose in email. Nothing more: your wording and voice are preserved. |
+| "reply to this saying I can't make it tonight" | the **reply** is typed, not the instruction — the model reads the conversation from a screenshot of the focused window (or your selection) |
+| "give me the command to find what's using that port" (error in clipboard) | `lsof -i :8080` |
+| "say good morning everyone in spanish" | `Buenos días a todos …` — and replies to a foreign-language thread match its language automatically |
+| *(after a reply)* "actually make it more apologetic" | the previous output is **rewritten in place** — sculpt text by talking at it |
+| "literally …anything…" | verbatim escape: the guard word is removed and the rest is typed exactly as dictated, never sent to the LLM |
+
+**Context the model sees**: focused window class+title, primary selection, clipboard, the last 4 exchanges (so "that"/"it" resolve), and — with a vision model — a **screenshot of the focused window** (`contextual.screenshot`: `"local"` default = images never leave the machine, `"always"`, `"off"`).
+
+**It streams**: the replacement is typed token-by-token (`contextual.stream`) — perceived latency is time-to-first-token (~0.3 s on the local model, prewarmed while you speak), with a final authoritative pass fixing anything the stream got wrong.
+
+**You lose nothing, ever**: LLM down/slow/misconfigured → the dictated text is already on screen and stays. Speaking again before the transform lands cancels it. Toggling off right after speaking waits (bounded by `contextual.timeout_s`).
+
+### Voice edit commands (LLM-free, work in standard mode too)
+
+An utterance that is *exactly* the phrase: **"scratch that"** (or "delete that"/"undo that") deletes the previous utterance · **"new line"** inserts a line break · **"press enter"** (or "hit enter") hits Return · **"press tab"** / **"press escape"** press those keys · **"copy that"** puts the previous utterance on the clipboard.
+
+### Long speech just works
+
+There is no practical utterance length limit: internally the engine rolls into a fresh utterance at `vad.max_utterance_s` (default 120 s) with **no onset gap and no chopped words**, and in contextual mode the whole chain is transformed as **one message** at your real pause. Thinking pauses don't fragment your message either — contextual mode uses a longer pause threshold (`contextual.min_silence_ms`, default 800 ms) than standard mode's 500 ms.
+
+### Make it sound like you
+
+```json
+"contextual": {
+  "persona": "I'm Taz. Casual with friends, lowercase ok. Sign work emails 'T'.",
+  "vocabulary": ["Hyprland", "wl-dictate", "Qwen", "OpenRouter"],
+  "app_hints": { "vesktop": "very casual, emoji fine", "betterbird": "professional email tone" }
+}
+```
+
+- `persona` — who's speaking; shapes tone and sign-offs in composed replies.
+- `vocabulary` — names/jargon fed to **both** the LLM and Whisper's decoder prompt, so your terms stop being misheard in *both* dictation modes.
+- `app_hints` — window-class substring → extra instruction for that app.
+
+### Endpoint profiles
+
+Switching is the single `contextual.profile` field:
 
 | profile | backend | endpoint | model |
 |---|---|---|---|
-| `local` (default) | OpenAI-compatible | `http://127.0.0.1:8890/v1` (llama.cpp) | `qwen3.5-9b` |
+| `local` (default) | OpenAI-compatible | `http://127.0.0.1:8890/v1` (llama.cpp) | `qwen3.5-9b` (vision + MTP) |
+| `local35` | OpenAI-compatible | `http://127.0.0.1:8888/v1` | `qwen36-35b-a3b` — smarter transforms when your 35B server is running |
 | `openrouter` | OpenAI-compatible | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` |
 | `anthropic` | Anthropic SDK | api.anthropic.com | `claude-haiku-4-5` |
 
-**Local model**: `scripts/llama-contextual.sh` launches `llama-server` with Qwen3.5-9B and MTP speculative decoding (fast generation) on port 8890 — no API key needed. Watch the MTP acceptance rate in `--metrics` and tune `MTP_DRAFT_MAX`.
+**Local server**: `scripts/llama-contextual.sh` launches `llama-server`; the model and MTP settings live in **`~/.config/wl-dictate/llama.toml`** (falls back to `scripts/llama.toml`):
+
+```toml
+[server]
+model = "unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M"  # any llama.cpp -hf spec
+alias = "qwen3.5-9b"
+port = 8890
+ctx_size = 16384
+
+[mtp]
+enabled = true    # requires an MTP-preserving GGUF; disable otherwise
+draft_max = 11    # tune by "draft acceptance" in the server log
+draft_min = 0
+```
+
+Environment variables (`PORT`, `CTX_SIZE`, `MTP_DRAFT_MAX`, …) override the TOML. MTP speculative decoding is the big generation-speed multiplier; the log prints per-request `draft acceptance` — consistently high (>0.5) → raise `draft_max`, consistently low (<0.2) → lower it.
 
 **API keys** (cloud profiles): the key file is the systemd-friendly path —
 
@@ -82,7 +135,7 @@ echo sk-ant-... > ~/.config/wl-dictate/anthropic.key && chmod 600 ~/.config/wl-d
 
 or set the env var (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) via a systemd drop-in (`systemctl --user edit wl-dictate.service` → `[Service]` `Environment=OPENAI_API_KEY=...`). The file wins if both exist.
 
-Semantics worth knowing: the transform runs per utterance after you pause; if you start speaking again before it returns, that utterance's transform is cancelled and the raw text stays (nothing is ever rewritten underneath new speech). Toggling dictation off right after speaking waits (bounded by `contextual.timeout_s`) for the last transform. **Privacy**: on the `openrouter`/`anthropic` profiles your transcript, selection, and clipboard are sent to that provider — the default profile is fully local.
+**Privacy**: on the `openrouter`/`anthropic` profiles your transcript, selection, and clipboard are sent to that provider (screenshots only if you set `screenshot: "always"`) — the default profile is fully local.
 
 ## Configuration
 
@@ -128,6 +181,7 @@ Useful knobs:
 - `vad.speculative_silence_ms` — **speculative finalize**: after this much silence the final decode starts early, so when the pause reaches `min_silence_ms` the result is already computed — final text lands the instant the utterance ends. Resuming speech discards the speculation (some GPU time wasted, nothing else). 0 disables.
 - `streaming.min_infer_interval_s` — adaptive decode cadence floor: the live re-decode interval tracks 1.5× the measured decode time between this floor and `infer_interval_s`, so a fast GPU + short utterance self-corrects at up to 4 Hz.
 - Long contextual replacements (≥120 chars) in Electron apps are delivered via clipboard paste (Ctrl+V, previous clipboard restored) instead of keystrokes — a 200-char rewrite lands in one keystroke instead of ~1.2 s of typing.
+- `ui.osd` — on-screen "🎤 Dictating" status pill (default true); `ui.sound_cues` — start/stop sounds (default false); `ui.idle_stop_s` — auto-stop dictation after N seconds without speech, 0 = never (mic privacy).
 - `audio.persistent_capture` — keep the mic stream open across toggles (default true). Opening/closing a USB mic renegotiates isochronous bandwidth on its USB controller, which can audibly glitch *other* audio devices on the same controller; persistent capture negotiates once. While dictation is off, captured audio is discarded immediately and never transcribed. Set `false` to fully release the mic on toggle-off.
 - Invalid values fall back to defaults with a warning in the log; unknown keys are reported, never fatal.
 

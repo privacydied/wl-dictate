@@ -145,6 +145,11 @@ class GateResult:
     utterance_maybe_ended: bool = False
     # Speech resumed after ``utterance_maybe_ended``: discard the speculation.
     speculation_cancelled: bool = False
+    # Seamless rollover: the utterance hit max_utterance_s while speech was
+    # STILL ACTIVE. It was force-ended (utterance_ended+forced) and a new one
+    # begins immediately — no onset re-detection, no dropped audio, and the
+    # caller should treat the two as one logical message (carry).
+    utterance_restarted: bool = False
 
 
 class VadGate:
@@ -253,7 +258,14 @@ class VadGate:
         if self._silence_run >= self._silence_frames_needed:
             self._end_utterance(result, forced=False)
         elif self._utterance_frames >= self._max_utterance_frames:
+            # Length cap hit while the user is STILL TALKING: end this
+            # utterance (bounds decode/typing state) but roll straight into a
+            # new one — no onset re-detection gap, no chopped message.
             self._end_utterance(result, forced=True)
+            self._in_speech = True
+            self._silence_run = 0
+            self._utterance_frames = 0
+            result.utterance_restarted = True
         return result
 
     def flush(self) -> GateResult:

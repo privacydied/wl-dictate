@@ -95,7 +95,11 @@ class VadConfig:
     speculative_silence_ms: int = 200
     pre_roll_ms: int = 320
     min_speech_s: float = 0.3
-    max_utterance_s: float = 28.0
+    # Length cap per engine utterance. Hitting it no longer chops your
+    # message: the gate rolls seamlessly into a new utterance (no onset gap)
+    # and contextual mode transforms the whole chain as one message. Buffer
+    # trimming bounds decode cost, so this is just a state-bounding safety.
+    max_utterance_s: float = 120.0
 
 
 @dataclass
@@ -173,6 +177,13 @@ def _default_contextual_profiles() -> dict[str, ContextualProfile]:
             api_key_env="OPENAI_API_KEY",
             api_key_file="~/.config/wl-dictate/openrouter.key",
         ),
+        "local35": ContextualProfile(
+            backend="openai",
+            # The q35-fast llama-server (Qwen3.6-35B): much smarter transforms
+            # when it's running; text-only unless its mmproj is loaded.
+            base_url="http://127.0.0.1:8888/v1",
+            model="qwen36-35b-a3b",
+        ),
         "anthropic": ContextualProfile(
             backend="anthropic",
             # claude-haiku-4-5: latency-appropriate for per-utterance
@@ -192,7 +203,29 @@ class ContextualConfig:
     timeout_s: float = 10.0  # whole LLM budget; on timeout the Whisper text stays
     max_output_tokens: int = 1000
     context_max_chars: int = 4000  # per-source cap for selection/clipboard
+    # Attach a screenshot of the focused window (vision models see the
+    # conversation you're replying to). "local": only for local endpoints
+    # (privacy default) | "always": also cloud profiles | "off".
+    screenshot: str = "local"
+    # Stream the replacement: tokens are typed as they generate (perceived
+    # latency = time-to-first-token) instead of waiting for the full output.
+    stream: bool = True
+    # Pause length that ends an utterance in CONTEXTUAL mode. Longer than the
+    # standard vad.min_silence_ms so thinking pauses don't fragment your
+    # message into separate transforms. 0 = use vad.min_silence_ms.
+    min_silence_ms: int = 800
     notify: bool = True  # "Transforming…" / error toasts via notify-send
+    # Who is speaking: name, tone preferences, sign-offs — included in the
+    # transform system prompt so replies sound like YOU.
+    # e.g. "I'm Taz. Casual with friends, lowercase ok. Sign work emails 'T'."
+    persona: str = ""
+    # Names/jargon the speech recognizer and the transform should know
+    # (project names, people, technical terms). Also biases Whisper decoding,
+    # so these words stop being misheard in BOTH dictation modes.
+    vocabulary: list[str] = field(default_factory=list)
+    # Per-app guidance: substring of the window class -> extra instruction.
+    # e.g. {"vesktop": "very casual, emoji fine", "betterbird": "professional email tone"}
+    app_hints: dict[str, str] = field(default_factory=dict)
     profiles: dict[str, ContextualProfile] = field(
         default_factory=_default_contextual_profiles
     )
@@ -206,7 +239,13 @@ class ContextualConfig:
             "timeout_s": self.timeout_s,
             "max_output_tokens": self.max_output_tokens,
             "context_max_chars": self.context_max_chars,
+            "screenshot": self.screenshot,
+            "stream": self.stream,
+            "min_silence_ms": self.min_silence_ms,
             "notify": self.notify,
+            "persona": self.persona,
+            "vocabulary": list(self.vocabulary),
+            "app_hints": dict(self.app_hints),
             "profiles": {name: dict(vars(p)) for name, p in self.profiles.items()},
         }
         return out
@@ -218,9 +257,27 @@ class ContextualConfig:
             "timeout_s": (int, float),
             "max_output_tokens": int,
             "context_max_chars": int,
+            "screenshot": str,
+            "stream": bool,
+            "min_silence_ms": int,
             "notify": bool,
+            "persona": str,
         }
         for key, value in raw.items():
+            if key == "vocabulary":
+                if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    self.vocabulary = value
+                else:
+                    warnings.append("invalid contextual.vocabulary; keeping default")
+                continue
+            if key == "app_hints":
+                if isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+                ):
+                    self.app_hints = value
+                else:
+                    warnings.append("invalid contextual.app_hints; keeping default")
+                continue
             if key == "profiles":
                 if not isinstance(value, dict):
                     warnings.append("invalid contextual.profiles; keeping defaults")
@@ -250,7 +307,7 @@ class ContextualConfig:
                 continue
             expected = scalar_types[key]
             ok = isinstance(value, expected)
-            if key != "notify" and isinstance(value, bool):
+            if expected is not bool and isinstance(value, bool):
                 ok = False  # bool is an int subclass; reject for numeric fields
             if ok:
                 if key == "timeout_s":
@@ -269,6 +326,11 @@ class ContextualConfig:
         if not (0.5 <= self.timeout_s <= 60.0):
             warnings.append("contextual.timeout_s out of range [0.5, 60]; using 10")
             self.timeout_s = 10.0
+        if self.screenshot not in ("off", "local", "always"):
+            warnings.append(
+                f"invalid contextual.screenshot '{self.screenshot}'; using 'local'"
+            )
+            self.screenshot = "local"
         for name, profile in self.profiles.items():
             if profile.backend not in ("openai", "anthropic"):
                 warnings.append(
@@ -276,6 +338,18 @@ class ContextualConfig:
                     f" '{name}'; using 'openai'"
                 )
                 profile.backend = "openai"
+
+
+@dataclass
+class UiConfig:
+    # On-screen status pill ("● Dictating…" / mode) — the tray icon alone is
+    # easy to miss; this gives an unmissable are-we-listening indicator.
+    osd: bool = True
+    # Play freedesktop start/stop sounds on toggle (paplay).
+    sound_cues: bool = False
+    # Auto-stop dictation after this many seconds with no committed speech
+    # (mic privacy / battery). 0 = never.
+    idle_stop_s: float = 0.0
 
 
 @dataclass
@@ -302,6 +376,7 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     typing: TypingConfig = field(default_factory=TypingConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
     # Special-cased in to_dict/from_dict (owns its own round-trip).
     contextual: ContextualConfig = field(default_factory=ContextualConfig)
 
@@ -315,6 +390,7 @@ class Config:
         "vad": VadConfig,
         "typing": TypingConfig,
         "audio": AudioConfig,
+        "ui": UiConfig,
     }
 
     def to_dict(self) -> dict[str, Any]:

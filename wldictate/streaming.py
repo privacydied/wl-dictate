@@ -101,6 +101,10 @@ class StreamingSession:
 
     def _reset_utterance_state(self) -> None:
         self._buffer = np.zeros(0, dtype=np.float32)
+        # O(1) feed: frames accumulate here and are concatenated lazily once
+        # per decode instead of on every 32ms frame.
+        self._chunks: list[np.ndarray] = []
+        self._buffer_len = 0
         self._committed: list[Word] = []
         self._prev_norm: list[str] = []
         self._committed_text = ""  # raw committed text (prompt context)
@@ -112,7 +116,9 @@ class StreamingSession:
         self._last_raw = ""  # raw of the last rendered hypothesis
         self._render_ok = True  # False after a sync failure: screen unknown
 
-    def start_utterance(self) -> None:
+    def start_utterance(self, carry: bool = False) -> None:
+        """Begin an utterance; ``carry`` marks a seamless long-speech rollover
+        (the emitter keeps accumulating the previous region)."""
         self._utterance_id += 1
         self._in_utterance = True
         self._reset_utterance_state()
@@ -120,12 +126,20 @@ class StreamingSession:
         if self._correcting:
             begin = getattr(self._emitter, "begin_utterance", None)
             if begin is not None:
-                begin()
+                begin(carry)
 
     def feed(self, frames: list[np.ndarray]) -> None:
         if not self._in_utterance or not frames:
             return
-        self._buffer = np.concatenate([self._buffer, *frames])
+        self._chunks.extend(frames)
+        self._buffer_len += sum(len(f) for f in frames)
+
+    def _audio(self) -> np.ndarray:
+        """Materialize the audio buffer (lazy concat of pending frames)."""
+        if self._chunks:
+            self._buffer = np.concatenate([self._buffer, *self._chunks])
+            self._chunks = []
+        return self._buffer
 
     # ── Periodic work (call frequently from the session loop) ───────────
 
@@ -146,11 +160,11 @@ class StreamingSession:
         now = self._clock()
         if now - self._last_decode_t < self._effective_interval():
             return
-        if len(self._buffer) - self._decoded_len < self._min_new:
+        if self._buffer_len - self._decoded_len < self._min_new:
             return
-        if len(self._buffer) < self._min_speech:
+        if self._buffer_len < self._min_speech:
             return
-        audio = self._buffer.copy()
+        audio = self._audio().copy()
         self._decoded_len = len(audio)
         self._last_decode_t = now
         self._inflight = (
@@ -180,11 +194,11 @@ class StreamingSession:
         gate cancels it and only some GPU time was wasted."""
         if not self._in_utterance or self._speculative is not None:
             return
-        if len(self._buffer) < self._min_speech and not self._committed:
+        if self._buffer_len < self._min_speech and not self._committed:
             return
         self._drain_inflight(block=False)
         self._speculative = (
-            self._submit_timed(self._buffer.copy(), final=True),
+            self._submit_timed(self._audio().copy(), final=True),
             self._utterance_id,
         )
 
@@ -207,7 +221,7 @@ class StreamingSession:
         self._in_utterance = False
         self._drain_inflight(block=True)
 
-        if len(self._buffer) < self._min_speech and not self._committed:
+        if self._buffer_len < self._min_speech and not self._committed:
             self._speculative = None
             self._reset_utterance_state()
             return None
@@ -225,7 +239,7 @@ class StreamingSession:
                 words = None  # fall through to a fresh final decode
         try:
             if words is None:
-                future = self._submit_timed(self._buffer, final=True)
+                future = self._submit_timed(self._audio(), final=True)
                 words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
         except Exception as e:
             self._error(f"final decode failed: {e}")
@@ -338,7 +352,7 @@ class StreamingSession:
 
     def _maybe_trim(self) -> None:
         """Bound decode cost: cut committed audio out of the buffer."""
-        if len(self._buffer) <= self._max_buffer or not self._committed:
+        if self._buffer_len <= self._max_buffer or not self._committed:
             return
         # Prefer the last committed sentence end; fall back to the last
         # committed word. Trim at the word's *end* timestamp.
@@ -350,8 +364,10 @@ class StreamingSession:
         cut = int(trim_word.end * SAMPLE_RATE)
         if cut <= 0:
             return
-        cut = min(cut, len(self._buffer))
-        self._buffer = self._buffer[cut:]
+        buffer = self._audio()  # materialize before slicing
+        cut = min(cut, len(buffer))
+        self._buffer = buffer[cut:]
+        self._buffer_len = len(self._buffer)
         self._decoded_len = max(0, self._decoded_len - cut)
         offset = cut / SAMPLE_RATE
 

@@ -1,15 +1,48 @@
 #!/usr/bin/env bash
 # llama-server for wl-dictate contextual dictation (the default "local"
-# profile): Qwen3.5-9B with MTP speculative decoding for fast generation.
+# profile). Model + MTP settings come from a TOML config:
+#   1. ~/.config/wl-dictate/llama.toml   (user copy — wins)
+#   2. scripts/llama.toml                (repo defaults)
+# Environment variables (PORT, CTX_SIZE, MTP_DRAFT_MAX, ...) override both.
 #
-# - Small context: dictation transforms need ~16k, not the model's native
-#   window — smaller KV cache, faster prompt processing.
-# - MTP speculative decoding is the biggest generation-speed multiplier when
-#   acceptance is high. Watch the acceptance rate in --metrics: high -> bump
-#   MTP_DRAFT_MAX to 5-6+, low -> lower it.
-# - Pairs with config.json: contextual.profile = "local",
-#   profiles.local.base_url = http://127.0.0.1:8890/v1 (alias must match).
+# The default Qwen3.5-9B ships MTP weights (fast speculative decoding) and a
+# vision projector (screenshot context). Watch "draft acceptance" in the log
+# to tune [mtp].draft_max.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOML="${LLAMA_TOML:-$HOME/.config/wl-dictate/llama.toml}"
+[ -f "$TOML" ] || TOML="$SCRIPT_DIR/llama.toml"
+
+# Read TOML -> shell assignments (tomllib is stdlib in python3.11+).
+eval "$(python3 - "$TOML" <<'PY'
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    cfg = {}
+server = cfg.get("server", {})
+mtp = cfg.get("mtp", {})
+def emit(name, value):
+    print(f'TOML_{name}="{value}"')
+emit("MODEL", server.get("model", "unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M"))
+emit("ALIAS", server.get("alias", "qwen3.5-9b"))
+emit("PORT", server.get("port", 8890))
+emit("CTX", server.get("ctx_size", 16384))
+emit("MTP_ENABLED", 1 if mtp.get("enabled", True) else 0)
+emit("MTP_MAX", mtp.get("draft_max", 11))
+emit("MTP_MIN", mtp.get("draft_min", 0))
+PY
+)"
+
+MODEL="${MODEL:-$TOML_MODEL}"
+ALIAS="${ALIAS:-$TOML_ALIAS}"
+PORT="${PORT:-$TOML_PORT}"
+CTX_SIZE="${CTX_SIZE:-$TOML_CTX}"
+MTP_ENABLED="${MTP_ENABLED:-$TOML_MTP_ENABLED}"
+MTP_DRAFT_MAX="${MTP_DRAFT_MAX:-$TOML_MTP_MAX}"
+MTP_DRAFT_MIN="${MTP_DRAFT_MIN:-$TOML_MTP_MIN}"
 
 export HF_HOME="${HF_HOME:-/mnt/SSD2/hf-cache}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
@@ -17,18 +50,24 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 # on big prompt batches.
 export GGML_CUDA_FORCE_MMQ=1
 
-PORT="${PORT:-8890}"
-CTX_SIZE="${CTX_SIZE:-16384}"
-MTP_DRAFT_MAX="${MTP_DRAFT_MAX:-11}"
+MTP_ARGS=()
+if [ "$MTP_ENABLED" = "1" ]; then
+  MTP_ARGS=(
+    --spec-type draft-mtp
+    --spec-draft-n-max "$MTP_DRAFT_MAX"
+    --spec-draft-n-min "$MTP_DRAFT_MIN"
+  )
+fi
 
-llama-server \
-  -hf unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M \
+echo "llama-contextual: model=$MODEL alias=$ALIAS port=$PORT ctx=$CTX_SIZE mtp=$MTP_ENABLED (config: $TOML)" >&2
+
+exec llama-server \
+  -hf "$MODEL" \
   --host 127.0.0.1 \
-  --port "${PORT}" \
-  --alias qwen3.5-9b \
-  --no-mmproj \
+  --port "$PORT" \
+  --alias "$ALIAS" \
   -ngl all \
-  --ctx-size "${CTX_SIZE}" \
+  --ctx-size "$CTX_SIZE" \
   --parallel 1 \
   --flash-attn on \
   --cache-type-k q4_0 \
@@ -41,6 +80,4 @@ llama-server \
   --reasoning-budget 0 \
   --temp 1 --top-p 0.8 --top-k 20 --min-p 0.0 \
   --metrics \
-  --spec-type draft-mtp \
-  --spec-draft-n-max "${MTP_DRAFT_MAX}" \
-  --spec-draft-n-min 0
+  "${MTP_ARGS[@]}"

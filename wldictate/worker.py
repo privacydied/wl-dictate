@@ -15,8 +15,9 @@ from queue import Empty, Queue
 
 from . import ipc
 from .audio import AudioCapture
+from .commands import match_command, strip_literal
 from .config import Config
-from .emitter import make_emitter
+from .emitter import CorrectingEmitter, make_emitter
 from .streaming import StreamingSession
 from .textproc import TextFormatter
 from .transcriber import FasterWhisperTranscriber
@@ -33,6 +34,65 @@ def _emit(ev: str, *, text: str | None = None, msg: str | None = None) -> None:
 
 def _log(msg: str) -> None:
     _emit("log", msg=msg)
+
+
+def _handle_final(final, emitter, formatter, coordinator, merge_all=False) -> None:
+    """Route a finalized utterance: voice command, verbatim escape, or
+    contextual transform (in that priority order)."""
+    if not final:
+        return
+    correcting = isinstance(emitter, CorrectingEmitter)
+    if not merge_all:  # a rollover chain is one long message, never a command
+        command = match_command(final)
+        if command and correcting:
+            _execute_voice_command(command, emitter, formatter)
+            return
+        literal = strip_literal(final) if correcting else None
+        if literal is not None:
+            # "literally ..." — type verbatim: remove the guard word from the
+            # screen and never send this utterance to the LLM.
+            emitter.sync(literal)
+            formatter.reseed(literal)
+            return
+    if coordinator is not None:
+        coordinator.submit(final, merge_all=merge_all)
+
+
+def _execute_voice_command(action: str, emitter: CorrectingEmitter, formatter) -> None:
+    """Run one LLM-free edit command. The spoken command itself is on screen
+    (live-typed) as the current utterance region and is always removed."""
+    if action == "scratch":
+        emitter.merge_previous()  # reach back over the previous utterance too
+        emitter.sync("")
+        formatter.reseed("")
+    elif action == "newline":
+        emitter.sync("\n")  # command text replaced by a line break
+        formatter.reseed("")
+    elif action == "enter":
+        emitter.sync("")  # remove the command text first
+        emitter.press_key("Return")
+        # Return typically submits (chat send) — the text is no longer ours.
+        emitter.reset_regions()
+        formatter.reseed("")
+    elif action == "tab":
+        emitter.sync("")
+        emitter.press_key("Tab")
+        # Tab may move focus — screen ownership is unknown afterwards.
+        emitter.reset_regions()
+        formatter.reseed("")
+    elif action == "escape":
+        emitter.sync("")
+        emitter.press_key("Escape")
+        emitter.reset_regions()
+        formatter.reseed("")
+    elif action == "copy":
+        # Copy the previous utterance to the clipboard; remove the spoken
+        # command; the text itself stays on screen.
+        emitter.sync("")
+        text = emitter.previous_logical.strip()
+        if text:
+            emitter.set_clipboard(text)
+        formatter.reseed(emitter.previous_logical)
 
 
 class _CaptureManager:
@@ -117,12 +177,17 @@ def _run_session(
         sentence_trailing_space=cfg.typing.sentence_trailing_space,
         capitalize_sentences=cfg.typing.capitalize_sentences,
     )
+    # Contextual mode uses a longer pause threshold so thinking pauses don't
+    # fragment one message into separate transforms.
+    min_silence_ms = cfg.vad.min_silence_ms
+    if contextual and cfg.contextual.min_silence_ms > 0:
+        min_silence_ms = max(min_silence_ms, cfg.contextual.min_silence_ms)
     gate = VadGate(
         make_vad(cfg.vad.backend),
         onset=cfg.vad.onset,
         offset=cfg.vad.offset,
         onset_frames=cfg.vad.onset_frames,
-        min_silence_ms=cfg.vad.min_silence_ms,
+        min_silence_ms=min_silence_ms,
         pre_roll_ms=cfg.vad.pre_roll_ms,
         max_utterance_s=cfg.vad.max_utterance_s,
         speculative_silence_ms=cfg.vad.speculative_silence_ms,
@@ -149,6 +214,7 @@ def _run_session(
             formatter,
             timeout_s=cfg.contextual.timeout_s,
             notify_enabled=cfg.contextual.notify,
+            stream_enabled=cfg.contextual.stream,
             on_error=lambda msg: _emit("error", msg=msg),
         )
 
@@ -159,6 +225,9 @@ def _run_session(
                 _log(f"capturing at {capture.sample_rate_in} Hz (resampling to 16 kHz)")
             _emit("listening")
             last_drop_warn = 0.0
+            # Transcripts of forced-rollover chunks (long speech split across
+            # engine utterances but ONE logical message for the transform).
+            chunk_parts: list[str] = []
             while not stop_event.is_set():
                 # 50ms cap: even with a silent queue the loop still drains
                 # completed decodes / transforms promptly.
@@ -183,8 +252,23 @@ def _run_session(
                         session.speculate_final()
                     if result.utterance_ended:
                         final = session.finalize()
-                        if coordinator is not None and final:
-                            coordinator.submit(final)
+                        if result.utterance_restarted:
+                            # Long-speech rollover: keep speaking seamlessly;
+                            # hold the transform until the real pause.
+                            if final:
+                                chunk_parts.append(final)
+                            session.start_utterance(carry=True)
+                        else:
+                            merge_all = bool(chunk_parts)
+                            if merge_all:
+                                if final:
+                                    final = "".join(chunk_parts) + final
+                                else:
+                                    final = None  # chain tail unknown: keep raw
+                                chunk_parts.clear()
+                            _handle_final(
+                                final, emitter, formatter, coordinator, merge_all
+                            )
                 session.tick()
                 if coordinator is not None:
                     coordinator.poll()
@@ -199,8 +283,11 @@ def _run_session(
             flush = gate.flush()
             if flush.utterance_ended:
                 final = session.finalize()
-                if coordinator is not None and final:
-                    coordinator.submit(final)
+                merge_all = bool(chunk_parts)
+                if merge_all:
+                    final = ("".join(chunk_parts) + final) if final else None
+                    chunk_parts.clear()
+                _handle_final(final, emitter, formatter, coordinator, merge_all)
             if coordinator is not None:
                 # Toggle-off right after speaking is the common case: give the
                 # in-flight transform its full budget, then apply or give up.
@@ -228,7 +315,11 @@ def run() -> int:
 
     _log(f"loading model '{cfg.model}'...")
     transcriber = FasterWhisperTranscriber(
-        model_name=cfg.model, device=cfg.device, compute_type=cfg.compute_type
+        model_name=cfg.model,
+        device=cfg.device,
+        compute_type=cfg.compute_type,
+        # Vocabulary biases Whisper decoding in BOTH dictation modes.
+        vocabulary=" ".join(cfg.contextual.vocabulary),
     )
     t0 = time.monotonic()
     try:

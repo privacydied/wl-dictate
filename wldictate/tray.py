@@ -21,9 +21,16 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PyQt5.QtCore import QSocketNotifier, QTimer
+from PyQt5.QtCore import QSocketNotifier, Qt, QTimer
 from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import QApplication, QActionGroup, QMenu, QSystemTrayIcon
+from PyQt5.QtWidgets import (
+    QApplication,
+    QActionGroup,
+    QLabel,
+    QMenu,
+    QSystemTrayIcon,
+    QWidget,
+)
 
 from . import ipc
 from .config import Config, socket_path, state_dir
@@ -34,6 +41,70 @@ _LOG_ROTATE_BYTES = 512 * 1024
 _RESTART_BACKOFF_BASE_S = 1.0
 _RESTART_BACKOFF_MAX_S = 30.0
 _RESTART_STABLE_RESET_S = 60.0
+
+
+OSD_TITLE = "wl-dictate-osd"
+
+
+class _StatusOsd(QWidget):
+    """Frameless on-screen status pill — an unmissable listening indicator.
+
+    On Wayland a parentless Qt.ToolTip never maps, so this is a real
+    frameless toplevel; Hyprland window rules (installed at tray startup,
+    keyed on the window title) make it float, pin to all workspaces, take no
+    focus, and sit bottom-center — it never disturbs tiling or steals keys
+    from the app being dictated into.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            None,
+            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint,
+        )
+        self.setWindowTitle(OSD_TITLE)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._label = QLabel(self)
+        self._label.setStyleSheet(
+            "QLabel { background-color: rgba(18, 18, 22, 235); color: #e8e8f0;"
+            " border-radius: 14px; padding: 7px 16px;"
+            " font-size: 13px; font-weight: 600; }"
+        )
+
+    def show_state(self, text: str) -> None:
+        self._label.setText(text)
+        self._label.adjustSize()
+        self.resize(self._label.size())
+        # Wayland ignores client-side positioning (the Hyprland rule places
+        # us); still move() for X11 sessions.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            self.move(
+                geo.x() + (geo.width() - self.width()) // 2,
+                geo.y() + geo.height() - self.height() - 48,
+            )
+        self.show()
+
+
+_CUE_SOUNDS = {
+    "start": "/usr/share/sounds/freedesktop/stereo/power-plug.oga",
+    "stop": "/usr/share/sounds/freedesktop/stereo/power-unplug.oga",
+}
+
+
+def _play_cue(kind: str) -> None:
+    path = _CUE_SOUNDS.get(kind, "")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        subprocess.Popen(
+            ["paplay", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 class _WorkerRelay(threading.Thread):
@@ -108,6 +179,8 @@ class DictationTrayApp:
         self._worker_ready = False
         self._active_mode: str | None = None  # None | "standard" | "contextual"
         self._hold_session = False  # current session was started by push-to-talk
+        self._osd = _StatusOsd() if self.config.ui.osd else None
+        self._last_activity = time.monotonic()  # for ui.idle_stop_s
         self._listening_notified = False
         self._cleaned = False
         self._shutting_down = False
@@ -124,6 +197,7 @@ class DictationTrayApp:
         self._socket_path = str(socket_path())
         self._start_socket_listener()
         self._ensure_wayland_hotkey_binding()
+        self._ensure_osd_rules()
 
         self.set_icon(False)
         self.tray_icon.show()
@@ -268,6 +342,52 @@ class DictationTrayApp:
             label=None,  # one notification for the pair is enough
         )
 
+    def _ensure_osd_rules(self) -> None:
+        """Hyprland rules for the OSD pill: floating, pinned to every
+        workspace, focus-proof, bottom-center.
+
+        Runtime ``hyprctl keyword windowrule`` additions are accepted but NOT
+        applied to new windows on current Hyprland — window rules only work
+        from the config. So the tray maintains a small sourced rules file and
+        adds one ``source =`` line to hyprland.conf (marker-guarded, once).
+        """
+        if self._osd is None:
+            return
+        if os.environ.get("XDG_CURRENT_DESKTOP") != "Hyprland":
+            return
+        try:
+            rules_path = Path(
+                os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            ) / "wl-dictate" / "hyprland-osd.conf"
+            # NOTE: fields are space-separated ("match:title <regex>, float
+            # yes") — an "=" inside the field is silently treated as part of
+            # the value and the rule matches nothing.
+            rules = (
+                "# Managed by wl-dictate — status pill (OSD) window rules.\n"
+                f"windowrule = match:title ^({OSD_TITLE})$,"
+                " float yes, pin yes, no_focus yes\n"
+                f"windowrule = match:title ^({OSD_TITLE})$,"
+                " move 50%-w/2 100%-h-48\n"
+            )
+            rules_path.parent.mkdir(parents=True, exist_ok=True)
+            fresh = not rules_path.exists() or rules_path.read_text() != rules
+            if fresh:
+                rules_path.write_text(rules)
+
+            hypr_conf = Path(
+                os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            ) / "hypr" / "hyprland.conf"
+            source_line = f"source = {rules_path}"
+            sourced = hypr_conf.exists() and source_line in hypr_conf.read_text()
+            if not sourced and hypr_conf.exists():
+                with open(hypr_conf, "a") as f:
+                    f.write(f"\n# wl-dictate OSD rules (auto-added)\n{source_line}\n")
+                notify("Added wl-dictate OSD window rules to hyprland.conf")
+            if fresh or not sourced:
+                self._run_hyprctl("reload")
+        except Exception as e:
+            print(f"could not install OSD window rules: {e}", file=sys.stderr)
+
     def _ensure_bind(self, binds, *, key, command, label, release=False) -> None:
         """Install one Ctrl+Alt+<key> runtime bind unless the combo is taken.
 
@@ -376,7 +496,16 @@ class DictationTrayApp:
             elif event.ev == "error":
                 self._write_worker_log(f"worker error: {event.msg}\n")
             elif event.ev == "commit":
-                pass  # already typed by the worker; logged via raw tee
+                self._last_activity = time.monotonic()  # speech is flowing
+        # Idle auto-stop (mic privacy): no committed speech for idle_stop_s.
+        idle_stop = self.config.ui.idle_stop_s
+        if (
+            self.is_dictating
+            and idle_stop > 0
+            and time.monotonic() - self._last_activity > idle_stop
+        ):
+            self.stop_dictation()
+            notify("Dictation auto-stopped (idle)")
 
     def _on_worker_exit(self, exit_code: int) -> None:
         self._worker_ready = False
@@ -579,7 +708,10 @@ class DictationTrayApp:
                 mode=mode,
             )
             self._active_mode = mode
+            self._last_activity = time.monotonic()
             self.set_icon(True)
+            if self.config.ui.sound_cues:
+                _play_cue("start")
             if notice:
                 notify(notice)
             elif not was_ready:
@@ -600,6 +732,8 @@ class DictationTrayApp:
                 pass
         self.set_icon(False)
         if not during_cleanup and not self._shutting_down:
+            if self.config.ui.sound_cues:
+                _play_cue("stop")
             notify("Dictation stopped")
 
     # ── Icons / resources ────────────────────────────────────────────────
@@ -627,6 +761,14 @@ class DictationTrayApp:
             else ""
         )
         self.tray_icon.setToolTip(f"Dictation: {status}{device}")
+        if self._osd is not None:
+            if active:
+                label = "🎤 Dictating"
+                if self._active_mode == "contextual":
+                    label += " · contextual"
+                self._osd.show_state(label)
+            else:
+                self._osd.hide()
 
     # ── Logging ──────────────────────────────────────────────────────────
 

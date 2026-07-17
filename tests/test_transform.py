@@ -176,8 +176,15 @@ class FakeBackend:
         self.reply = reply
         self.calls = []
 
-    def complete(self, system, user, *, model, max_tokens):
-        self.calls.append({"system": system, "user": user, "model": model})
+    def complete(self, system, messages, *, model, max_tokens):
+        self.calls.append(
+            {
+                "system": system,
+                "messages": messages,
+                "user": messages[-1]["content"],
+                "model": model,
+            }
+        )
         if isinstance(self.reply, Exception):
             raise self.reply
         return self.reply

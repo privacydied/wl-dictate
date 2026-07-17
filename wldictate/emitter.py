@@ -54,6 +54,14 @@ class Emitter(ABC):
         use a faster delivery (clipboard paste). Default: plain rewrite."""
         return self.rewrite(backspaces, text)
 
+    def press_key(self, keysym: str) -> bool:
+        """Press a named key (e.g. "Return"). Default: unsupported."""
+        return False
+
+    def set_clipboard(self, text: str) -> bool:
+        """Put text on the clipboard. Default: unsupported."""
+        return False
+
     def close(self) -> None:  # pragma: no cover - default no-op
         pass
 
@@ -289,6 +297,23 @@ class WtypeEmitter(Emitter):
             return None  # backspaces may have landed: caller treats as failure
         return text
 
+    def press_key(self, keysym: str) -> bool:
+        cmd = ["wtype"]
+        if self._press_delay_ms > 0:
+            cmd += ["-s", str(self._press_delay_ms)]
+        cmd += ["-k", keysym]
+        try:
+            result = subprocess.run(
+                cmd, env=self._env, timeout=self._timeout, capture_output=True, text=True
+            )
+            return result.returncode == 0
+        except Exception as e:
+            print(f"wtype key press failed: {e}", file=sys.stderr)
+            return False
+
+    def set_clipboard(self, text: str) -> bool:
+        return self._write_clipboard(text)
+
     def _read_clipboard(self) -> str | None:
         try:
             result = subprocess.run(
@@ -328,15 +353,51 @@ class CorrectingEmitter(Emitter):
     def __init__(self, device: Emitter) -> None:
         self._device = device
         self._screen = ""  # physical chars typed this utterance (may hold ZWSP)
+        # Physical text of the PREVIOUS utterance (one level of history) —
+        # enables revise-in-place and "scratch that" to reach back across the
+        # baseline. Cleared whenever screen state becomes unknown.
+        self._prev_screen = ""
         self._frozen = False  # device failure: screen state unknown
 
-    def begin_utterance(self) -> None:
-        """Reset the typing baseline; everything before it is immutable."""
+    def begin_utterance(self, carry: bool = False) -> None:
+        """Advance the typing baseline; the previous utterance's region is
+        kept (revisable/deletable), anything older is immutable.
+
+        ``carry``: this utterance seamlessly continues the previous one (a
+        long-speech rollover) — the previous region ACCUMULATES instead of
+        being replaced, so a later combined transform can rewrite the whole
+        chain as one message."""
+        if self._frozen:
+            self._prev_screen = ""
+        elif carry:
+            self._prev_screen = self._prev_screen + self._screen
+        else:
+            self._prev_screen = self._screen
         self._screen = ""
         self._frozen = False
 
+    @property
+    def previous_len(self) -> int:
+        """Physical length of the previous utterance's region (0 = none)."""
+        return len(self._prev_screen)
+
+    def merge_previous(self) -> bool:
+        """Fold the previous utterance's region into the current mutable
+        region, so the next ``sync`` can rewrite or delete across both.
+        Returns False when there is no previous region to reach."""
+        if self._frozen or not self._prev_screen:
+            return False
+        self._screen = self._prev_screen + self._screen
+        self._prev_screen = ""
+        return True
+
     def _logical(self) -> str:
         return self._screen.replace(ZWSP, "")
+
+    @property
+    def logical(self) -> str:
+        """Visible text of the current mutable region (ZWSPs excluded)."""
+        return self._logical()
 
     def sync(
         self,
@@ -398,6 +459,23 @@ class CorrectingEmitter(Emitter):
         if not text:
             return True
         return self.sync(self._logical() + text)
+
+    def press_key(self, keysym: str) -> bool:
+        return self._device.press_key(keysym)
+
+    def set_clipboard(self, text: str) -> bool:
+        return self._device.set_clipboard(text)
+
+    @property
+    def previous_logical(self) -> str:
+        """Visible text of the previous utterance's region."""
+        return self._prev_screen.replace(ZWSP, "")
+
+    def reset_regions(self) -> None:
+        """Screen ownership ended (e.g. Return sent a chat message): nothing
+        on screen belongs to us anymore."""
+        self._screen = ""
+        self._prev_screen = ""
 
     def close(self) -> None:
         self._device.close()

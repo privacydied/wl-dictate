@@ -1,6 +1,6 @@
 [project]
 name = "wl-dictate"
-version = "1.3.0"
+version = "1.4.0"
 description = "Low-latency realtime voice dictation for Linux Wayland/X11"
 requires-python = ">=3.13"
 dependencies = [

@@ -1,0 +1,21 @@
+# wl-dictate local LLM server config — read by scripts/llama-contextual.sh.
+# Copy to ~/.config/wl-dictate/llama.toml to customize (the script prefers
+# that path); environment variables (PORT, CTX_SIZE, ...) override everything.
+
+[server]
+# Any llama.cpp -hf spec (hf repo:quant). For vision context ("reply to this"
+# reading the screen) pick a model that ships an mmproj.
+model = "unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M"
+alias = "qwen3.5-9b"  # keep in sync with contextual.profiles.local.model
+port = 8890
+ctx_size = 16384      # dictation transforms need ~16k, not the native window
+
+[mtp]
+# MTP speculative decoding — the biggest generation-speed multiplier, but the
+# GGUF must ship MTP weights (repos tagged "MTP" / "MTP-Preserved"). Disable
+# for models without them or llama-server will reject the --spec-type flag.
+enabled = true
+# Draft length: watch "draft acceptance" in the server log — consistently high
+# (>0.5) -> raise toward 11-16; consistently low (<0.2) -> lower toward 4-6.
+draft_max = 11
+draft_min = 0

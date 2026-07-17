@@ -181,3 +181,27 @@ def test_speculation_disabled_when_zero_or_too_large():
         for _ in range(6):
             maybes += gate.process(_silence_frame()).utterance_maybe_ended
         assert maybes == 0, f"spec_ms={spec_ms} should disable speculation"
+
+
+def test_long_speech_rolls_over_seamlessly():
+    # Cap at ~4 frames of continuous speech: forced end + immediate restart.
+    gate = VadGate(
+        _ScriptVAD([1] * 12),
+        onset_frames=2,
+        min_silence_ms=128,
+        speculative_silence_ms=0,
+        pre_roll_ms=0,
+        max_utterance_s=4 * FRAME_SAMPLES / 16000,
+    )
+    started = ended = restarted = 0
+    for _ in range(12):
+        r = gate.process(_speech_frame())
+        started += r.utterance_started
+        ended += r.utterance_ended
+        restarted += r.utterance_restarted
+        if r.utterance_ended:
+            assert r.forced and r.utterance_restarted
+        assert not (r.utterance_started and r.utterance_ended)
+    assert started == 1  # only the initial onset
+    assert ended == restarted >= 2  # every cap hit rolled over, no gap
+    assert gate.in_speech  # still listening at the end

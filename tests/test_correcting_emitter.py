@@ -146,3 +146,18 @@ def test_max_backspaces_override_allows_full_replacement():
     # Default cap would clamp at 500; the transform path passes a big budget.
     assert ce.sync("b" * 3, max_backspaces=4000)
     assert dev.ops[-1] == (700, "bbb")
+
+
+def test_begin_utterance_carry_accumulates_previous():
+    ce, dev = make()
+    ce.sync("chunk one. ")
+    ce.begin_utterance(carry=True)
+    ce.sync("chunk two. ")
+    ce.begin_utterance(carry=True)
+    ce.sync("chunk three.")
+    assert ce.previous_len == len("chunk one. chunk two. ")
+    # merge_previous folds the WHOLE chain for a combined rewrite.
+    assert ce.merge_previous()
+    assert ce.logical == "chunk one. chunk two. chunk three."
+    assert ce.sync("All rewritten.")
+    assert dev.ops[-1][0] == len("chunk one. chunk two. chunk three.")

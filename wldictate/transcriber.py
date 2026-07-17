@@ -49,10 +49,14 @@ class FasterWhisperTranscriber(Transcriber):
         model_name: str = "distil-small.en",
         device: str = "auto",
         compute_type: str = "auto",
+        vocabulary: str = "",
     ) -> None:
         self._model_name = model_name
         self._device_pref = device
         self._compute_pref = compute_type
+        # User glossary (names/jargon) prepended to the decoder prompt so
+        # domain terms bias decoding instead of being misheard.
+        self._vocabulary = vocabulary.strip()
         self._model = None
         self.device = "unloaded"
         self.compute_type = "unloaded"
@@ -122,6 +126,8 @@ class FasterWhisperTranscriber(Transcriber):
     ) -> list[Word]:
         if self._model is None:
             raise RuntimeError("model not loaded")
+        if self._vocabulary:
+            prompt = f"(Glossary: {self._vocabulary}.) {prompt or ''}".strip()
         segments, _ = self._model.transcribe(
             audio,
             language="en",
