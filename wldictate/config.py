@@ -89,7 +89,7 @@ class VadConfig:
 
 @dataclass
 class TypingConfig:
-    mode: str = "commit"  # commit (append-only); future: correcting
+    mode: str = "correcting"  # correcting (live rewrite) | commit (append-only)
     wtype_timeout_s: float = 10.0
     # Per-keystroke delay (ms) passed to `wtype -d`. Electron/Chromium apps
     # (Vesktop, Discord, VSCode, Slack) drop characters — usually spaces and
@@ -248,9 +248,11 @@ class Config:
                 f"invalid compute_type '{self.compute_type}'; using 'auto'"
             )
             self.compute_type = "auto"
-        if self.typing.mode not in ("commit",):
-            self.warnings.append(f"unsupported typing.mode '{self.typing.mode}'; using 'commit'")
-            self.typing.mode = "commit"
+        if self.typing.mode not in ("commit", "correcting"):
+            self.warnings.append(
+                f"unsupported typing.mode '{self.typing.mode}'; using 'correcting'"
+            )
+            self.typing.mode = "correcting"
         if self.vad.backend not in ("auto", "silero", "energy"):
             self.warnings.append(f"invalid vad.backend '{self.vad.backend}'; using 'auto'")
             self.vad.backend = "auto"

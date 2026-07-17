@@ -7,7 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from wldictate.emitter import NullEmitter, StdoutEmitter, WtypeEmitter, make_emitter
+from wldictate.emitter import (
+    CorrectingEmitter,
+    NullEmitter,
+    StdoutEmitter,
+    WtypeEmitter,
+    make_emitter,
+)
 
 
 class _Capture:
@@ -146,3 +152,89 @@ def test_make_emitter_env_override(monkeypatch):
     assert isinstance(make_emitter("commit"), NullEmitter)
     monkeypatch.setenv("WL_DICTATE_EMIT", "stdout")
     assert isinstance(make_emitter("commit"), StdoutEmitter)
+
+
+def test_make_emitter_correcting_wraps_device(monkeypatch):
+    monkeypatch.delenv("WL_DICTATE_EMIT", raising=False)
+    e = make_emitter("correcting", wtype_delay_ms=12)
+    assert isinstance(e, CorrectingEmitter)
+    assert isinstance(e._device, WtypeEmitter)
+    assert e._device._delay_ms == 12
+    # Env override selects the *device*; the mode still wraps it.
+    monkeypatch.setenv("WL_DICTATE_EMIT", "stdout")
+    e = make_emitter("correcting")
+    assert isinstance(e, CorrectingEmitter)
+    assert isinstance(e._device, StdoutEmitter)
+
+
+# ── rewrite (backspace + retype in one wtype invocation) ─────────────────────
+
+
+def test_rewrite_argv_with_delay(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    assert WtypeEmitter(delay_ms=6).rewrite(3, "abc") == "abc"
+    cmd, kwargs = cap.calls[0]
+    # Keys are paced by interleaved -s (wtype's -d paces only text typing);
+    # stdin text ("-") comes last so the retype lands after the backspaces.
+    assert cmd == [
+        "wtype", "-d", "6",
+        "-s", "6", "-k", "BackSpace",
+        "-s", "6", "-k", "BackSpace",
+        "-s", "6", "-k", "BackSpace",
+        "-",
+    ]  # fmt: skip
+    assert kwargs["input"] == "abc"
+
+
+def test_rewrite_argv_without_delay(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    WtypeEmitter(delay_ms=0).rewrite(2, "x")
+    cmd, _ = cap.calls[0]
+    assert cmd == ["wtype", "-k", "BackSpace", "-k", "BackSpace", "-"]
+
+
+def test_rewrite_pure_deletion_omits_stdin_placeholder(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    assert WtypeEmitter(delay_ms=0).rewrite(2, "") == ""
+    cmd, _ = cap.calls[0]
+    assert cmd == ["wtype", "-k", "BackSpace", "-k", "BackSpace"]
+
+
+def test_rewrite_noop_never_shells_out(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    assert WtypeEmitter().rewrite(0, "") == ""
+    assert cap.calls == []
+
+
+def test_rewrite_electron_gate_only_on_pure_append(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    e = WtypeEmitter(delay_ms=0)
+    monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
+    # Pure append with leading space: gated (same as emit today).
+    assert e.rewrite(0, " x") == ZWSP + " x"
+    # With backspaces the keys open Electron's gate; no ZWSP accumulation.
+    assert e.rewrite(2, " y") == " y"
+    _, kwargs = cap.calls[1]
+    assert kwargs["input"] == " y"
+
+
+def test_rewrite_failure_returns_none(monkeypatch):
+    def fail(cmd, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert WtypeEmitter().rewrite(1, "x") is None
+
+
+def test_emit_refactor_keeps_argv_and_reports_failure(monkeypatch):
+    # emit() now routes through rewrite(0, text); argv must be unchanged.
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    assert WtypeEmitter(delay_ms=6, press_delay_ms=40).emit("hi") is True
+    cmd, _ = cap.calls[0]
+    assert cmd == ["wtype", "-s", "40", "-d", "6", "-"]

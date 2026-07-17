@@ -161,6 +161,23 @@ class TextFormatter:
         self._tail = (self._tail + text)[-8:]
         return text
 
+    def peek(self, raw: str) -> str:
+        """Format ``raw`` exactly as :meth:`format_delta` would, WITHOUT
+        mutating spacing state.
+
+        Correcting mode re-renders the whole utterance-so-far on every decode,
+        so the render must be a pure function of (pre-utterance state, raw).
+        The mutable state is exactly ``(_tail, _utterance_has_output)``; it is
+        snapshotted and restored so the eventual finalize-time
+        ``format_delta`` of the final raw returns the same string the last
+        ``peek`` produced.
+        """
+        saved = (self._tail, self._utterance_has_output)
+        try:
+            return self.format_delta(raw)
+        finally:
+            self._tail, self._utterance_has_output = saved
+
     def _at_sentence_start(self) -> bool:
         """True when the next word begins a sentence.
 

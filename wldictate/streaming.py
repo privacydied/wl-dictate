@@ -2,9 +2,17 @@
 
 While an utterance is in progress, the engine re-decodes the utterance buffer
 every ``infer_interval_s`` and *commits* the longest prefix of words on which
-two consecutive hypotheses agree. Committed text is emitted immediately
-(append-only — it is never revised), so words appear roughly a second behind
-speech instead of after the whole utterance.
+two consecutive hypotheses agree.
+
+Two typing modes share the engine:
+
+- **commit** (append-only): committed text is emitted immediately and never
+  revised — words appear roughly a second behind speech.
+- **correcting** (live rewrite): after every decode the *full* current
+  hypothesis (stable prefix + tentative tail) is rendered and synced to the
+  screen through a ``CorrectingEmitter`` — raw words appear instantly and are
+  visibly fixed in place as the hypothesis refines; the final decode replaces
+  the tail once more and the utterance becomes immutable.
 
 Decodes run on a single background thread (CTranslate2 models must not be
 called concurrently); if a decode is still in flight when the next tick
@@ -54,6 +62,7 @@ class StreamingSession:
         max_buffer_s: float = 12.0,
         min_speech_s: float = 0.3,
         streaming_enabled: bool = True,
+        correcting: bool = False,
         on_commit: Callable[[str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -66,6 +75,7 @@ class StreamingSession:
         self._max_buffer = int(max_buffer_s * SAMPLE_RATE)
         self._min_speech = int(min_speech_s * SAMPLE_RATE)
         self._streaming_enabled = streaming_enabled
+        self._correcting = correcting
         self._on_commit = on_commit
         self._on_error = on_error
         self._clock = clock
@@ -86,12 +96,20 @@ class StreamingSession:
         self._committed_text = ""  # raw committed text (prompt context)
         self._decoded_len = 0
         self._last_decode_t = self._clock()
+        # Correcting-mode state:
+        self._trimmed_raw = ""  # raw text of committed words trimmed from buffer
+        self._last_raw = ""  # raw of the last rendered hypothesis
+        self._render_ok = True  # False after a sync failure: screen unknown
 
     def start_utterance(self) -> None:
         self._utterance_id += 1
         self._in_utterance = True
         self._reset_utterance_state()
         self._formatter.on_utterance_start()
+        if self._correcting:
+            begin = getattr(self._emitter, "begin_utterance", None)
+            if begin is not None:
+                begin()
 
     def feed(self, frames: list[np.ndarray]) -> None:
         if not self._in_utterance or not frames:
@@ -149,16 +167,37 @@ class StreamingSession:
             words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
         except Exception as e:
             self._error(f"final decode failed: {e}")
+            if self._correcting and self._last_raw:
+                # Tentative text is on screen; never delete the user's words.
+                # Advance formatter state to match what's stranded there so
+                # the next utterance's spacing is computed correctly.
+                self._formatter.format_delta(self._last_raw)
+                self._formatter.end_utterance()
             self._reset_utterance_state()
             return
 
-        tail = words[len(self._committed) :]
-        if tail:
-            self._commit_words(tail)
-        trailer = self._formatter.end_utterance()
-        if trailer and not self._emitter.emit(trailer):
-            self._error("emitter failed to type utterance trailer")
+        if self._correcting:
+            self._finalize_correcting(words)
+        else:
+            tail = words[len(self._committed) :]
+            if tail:
+                self._commit_words(tail)
+            trailer = self._formatter.end_utterance()
+            if trailer and not self._emitter.emit(trailer):
+                self._error("emitter failed to type utterance trailer")
         self._reset_utterance_state()
+
+    def _finalize_correcting(self, words: list[Word]) -> None:
+        """Replace the tentative tail with the final decode + trailer."""
+        raw = self._trimmed_raw + "".join(w.text for w in words)
+        # The one state-mutating format of this utterance (peek never mutates).
+        text = self._formatter.format_delta(raw) if raw.strip() else ""
+        trailer = self._formatter.end_utterance()
+        if self._render_ok:
+            if not self._emitter.sync(text + trailer):
+                self._error("emitter failed to sync final text")
+        if text and self._on_commit is not None:
+            self._on_commit(text + trailer)
 
     def stop(self) -> None:
         """Session teardown; finalizes any in-flight utterance first."""
@@ -193,10 +232,27 @@ class StreamingSession:
             agree += 1
         if agree > len(self._committed):
             fresh = words[len(self._committed) : agree]
-            self._commit_words(fresh)
+            if self._correcting:
+                # Bookkeeping only (prompt context); rendering happens below.
+                self._committed_text += "".join(w.text for w in fresh)
+            else:
+                self._commit_words(fresh)
             self._committed = list(words[:agree])
         self._prev_norm = norm_new
+        if self._correcting:
+            self._render(words)
         self._maybe_trim()
+
+    def _render(self, words: list[Word]) -> None:
+        """Correcting mode: sync the screen to the full current hypothesis."""
+        if not self._render_ok:
+            return
+        raw = self._trimmed_raw + "".join(w.text for w in words)
+        self._last_raw = raw
+        desired = self._formatter.peek(raw) if raw.strip() else ""
+        if not self._emitter.sync(desired):
+            self._render_ok = False
+            self._error("emitter failed to sync tentative text")
 
     def _commit_words(self, words: list[Word]) -> None:
         raw = "".join(w.text for w in words)
@@ -231,6 +287,9 @@ class StreamingSession:
         def keep(w: Word) -> bool:
             return w.end > offset
 
+        # Correcting mode renders trimmed words from their raw text, so the
+        # full utterance stays reconstructible after the audio is cut.
+        self._trimmed_raw += "".join(w.text for w in self._committed if not keep(w))
         kept_committed = [w.rebased(offset) for w in self._committed if keep(w)]
         # prev_norm must stay index-aligned with what the *next* decode of the
         # trimmed buffer will produce: committed words inside the cut vanish.

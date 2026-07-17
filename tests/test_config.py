@@ -63,7 +63,15 @@ def test_out_of_range_values_clamped():
 def test_invalid_device_and_mode():
     cfg = Config.from_dict({"device": "tpu", "typing": {"mode": "chaos"}})
     assert cfg.device == "auto"
+    assert cfg.typing.mode == "correcting"
+    assert cfg.warnings
+
+
+def test_typing_mode_defaults_to_correcting_and_accepts_commit():
+    assert Config.from_dict({}).typing.mode == "correcting"
+    cfg = Config.from_dict({"typing": {"mode": "commit"}})
     assert cfg.typing.mode == "commit"
+    assert not cfg.warnings
 
 
 def test_legacy_migration(tmp_path, monkeypatch):

@@ -219,3 +219,37 @@ def test_never_double_spaces_across_any_boundary():
     assert "  " not in out
     assert not out.startswith(" ")
     assert out == "One. two, three! four... five. "
+
+
+# ── peek (correcting mode's idempotent full-utterance render) ────────────────
+
+
+def test_peek_matches_format_delta_without_mutating_state():
+    f = TextFormatter()
+    f.on_utterance_start()
+    first = f.peek(" hello world.")
+    assert f.peek(" hello world.") == first  # idempotent
+    # The eventual state-mutating format of the same raw is identical…
+    assert f.format_delta(" hello world.") == first
+    # …and only IT advances the spacing state: the same raw now needs a
+    # separator because the tail is no longer empty.
+    assert f.peek(" hello world.") != first
+
+
+def test_peek_respects_cross_utterance_tail():
+    f = TextFormatter()
+    f.on_utterance_start()
+    f.format_delta(" First.")
+    f.end_utterance()
+    f.on_utterance_start()
+    # Renders against the previous utterance's tail ("First. ") — no leading
+    # separator needed, capitalized as a sentence start.
+    assert f.peek(" and then") == "And then"
+    assert f.format_delta(" and then") == "And then"
+
+
+def test_peek_does_not_flip_utterance_has_output():
+    f = TextFormatter()
+    f.on_utterance_start()
+    f.peek(" Done.")
+    assert f.end_utterance() == ""  # nothing actually emitted yet

@@ -1,9 +1,10 @@
 """Text emitters — deliver committed text to the focused window.
 
-``WtypeEmitter`` is the production emitter (append-only typing via wtype).
-The abstraction exists so alternative sinks (stdout for debugging, a future
-backspace-correcting emitter) can be swapped in without touching the
-streaming engine.
+``WtypeEmitter`` is the production device emitter (typing via wtype).
+``CorrectingEmitter`` wraps a device emitter and rewrites already-typed
+tentative text in place (backspace + retype) for the live self-correcting
+``typing.mode = "correcting"``. Alternative sinks (stdout for debugging,
+null for benchmarks) swap in without touching the streaming engine.
 """
 
 from __future__ import annotations
@@ -14,11 +15,27 @@ import subprocess
 import sys
 from abc import ABC, abstractmethod
 
+#: Zero-width space — invisible gate-opener for Electron's leading-space drop.
+ZWSP = "​"
+
+#: Safety cap on backspaces per sync: a pathological diff rewrites at most the
+#: last N physical characters instead of machine-gunning the whole utterance.
+_MAX_BACKSPACES = 500
+
 
 class Emitter(ABC):
     @abstractmethod
     def emit(self, text: str) -> bool:
         """Deliver text; returns True on success."""
+
+    def rewrite(self, backspaces: int, text: str) -> str | None:
+        """Delete ``backspaces`` characters, then type ``text``, atomically.
+
+        Returns the *physically typed* string (which may differ from ``text``,
+        e.g. an Electron ZWSP prefix), or None on failure. Default: devices
+        that cannot delete just emit the text (best effort).
+        """
+        return text if self.emit(text) else None
 
     def close(self) -> None:  # pragma: no cover - default no-op
         pass
@@ -30,6 +47,9 @@ class NullEmitter(Emitter):
     def emit(self, text: str) -> bool:
         return True
 
+    def rewrite(self, backspaces: int, text: str) -> str | None:
+        return text
+
 
 class StdoutEmitter(Emitter):
     """Prints text to stderr instead of typing (debugging/verification).
@@ -40,6 +60,10 @@ class StdoutEmitter(Emitter):
     def emit(self, text: str) -> bool:
         print(f"[emit] {text!r}", file=sys.stderr, flush=True)
         return True
+
+    def rewrite(self, backspaces: int, text: str) -> str | None:
+        print(f"[rewrite] -{backspaces} +{text!r}", file=sys.stderr, flush=True)
+        return text
 
 
 def _guess_wayland_env(env: dict[str, str]) -> None:
@@ -67,10 +91,10 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
 
 
 class WtypeEmitter(Emitter):
-    """Types text into the focused window with wtype (append-only)."""
+    """Types text into the focused window with wtype."""
 
-    #: Invisible gate-opener for Electron's leading-space drop (see emit()).
-    _ZWSP = "​"
+    #: Invisible gate-opener for Electron's leading-space drop (see rewrite()).
+    _ZWSP = ZWSP
 
     def __init__(
         self,
@@ -141,7 +165,24 @@ class WtypeEmitter(Emitter):
     def emit(self, text: str) -> bool:
         if not text:
             return True
-        if self._needs_electron_gate(text):
+        return self.rewrite(0, text) is not None
+
+    def rewrite(self, backspaces: int, text: str) -> str | None:
+        """Delete ``backspaces`` chars then type ``text`` in ONE wtype call.
+
+        wtype processes argv sequentially, so the BackSpace keys land before
+        the stdin text (the trailing ``-``). ``-d`` paces only *text* typing;
+        keys are paced by interleaving ``-s`` before each BackSpace (Electron
+        drops keys that arrive too fast). Returns the physically typed string
+        (ZWSP prefix included when the Electron gate fires) or None on error.
+        """
+        backspaces = max(0, backspaces)
+        if backspaces == 0 and not text:
+            return ""
+        # Electron gate only on pure appends: with backspaces > 0 the
+        # BackSpace keys themselves open Electron's fresh-connection gate, so
+        # the retyped leading space lands without ZWSP accumulation.
+        if backspaces == 0 and self._needs_electron_gate(text):
             text = self._ZWSP + text
         # Pass text on stdin via wtype's "-" placeholder rather than as an
         # argv word: text that begins with "-" (e.g. a spoken dash) would
@@ -151,7 +192,12 @@ class WtypeEmitter(Emitter):
             cmd += ["-s", str(self._press_delay_ms)]
         if self._delay_ms > 0:
             cmd += ["-d", str(self._delay_ms)]
-        cmd.append("-")
+        for _ in range(backspaces):
+            if self._delay_ms > 0:
+                cmd += ["-s", str(self._delay_ms)]
+            cmd += ["-k", "BackSpace"]
+        if text:
+            cmd.append("-")
         try:
             result = subprocess.run(
                 cmd,
@@ -163,18 +209,90 @@ class WtypeEmitter(Emitter):
             )
         except subprocess.TimeoutExpired:
             print("wtype timed out", file=sys.stderr)
-            return False
+            return None
         except FileNotFoundError:
             print("wtype is not installed", file=sys.stderr)
-            return False
+            return None
         except OSError as e:
             print(f"wtype failed to launch: {e}", file=sys.stderr)
-            return False
+            return None
         if result.returncode != 0:
             detail = (result.stderr or "").strip() or f"exit code {result.returncode}"
             print(f"wtype failed: {detail}", file=sys.stderr)
+            return None
+        return text
+
+
+class CorrectingEmitter(Emitter):
+    """Rewrites tentative text in place (live self-correcting mode).
+
+    Tracks the *physical* characters typed for the current utterance
+    (including invisible ZWSPs the Electron gate injects) and syncs the
+    screen to a desired string via a minimal common-prefix diff: backspace
+    the divergent suffix, retype the new one. Never backspaces past what the
+    current utterance typed, so text finalized before ``begin_utterance()``
+    is immutable.
+    """
+
+    def __init__(self, device: Emitter) -> None:
+        self._device = device
+        self._screen = ""  # physical chars typed this utterance (may hold ZWSP)
+        self._frozen = False  # device failure: screen state unknown
+
+    def begin_utterance(self) -> None:
+        """Reset the typing baseline; everything before it is immutable."""
+        self._screen = ""
+        self._frozen = False
+
+    def _logical(self) -> str:
+        return self._screen.replace(ZWSP, "")
+
+    def sync(self, desired: str) -> bool:
+        """Make the screen show ``desired`` (for this utterance's region)."""
+        if self._frozen:
             return False
+        logical = self._logical()
+        # Longest common prefix (logical view — ZWSPs are invisible).
+        p = 0
+        for a, b in zip(logical, desired):
+            if a != b:
+                break
+            p += 1
+        # Map logical prefix length -> physical index. A ZWSP gating a kept
+        # char stays with the kept prefix; a ZWSP *at* the boundary gated a
+        # now-deleted char, so it is deleted too (no stranded invisibles).
+        phys = 0
+        remaining = p
+        while phys < len(self._screen) and remaining > 0:
+            if self._screen[phys] != ZWSP:
+                remaining -= 1
+            phys += 1
+        backspaces = len(self._screen) - phys
+        suffix = desired[p:]
+        if backspaces > _MAX_BACKSPACES:
+            # Pathological rewrite: keep the (possibly wrong) older prefix and
+            # rewrite only the last _MAX_BACKSPACES physical chars.
+            phys = len(self._screen) - _MAX_BACKSPACES
+            backspaces = _MAX_BACKSPACES
+            kept_logical = len(self._screen[:phys].replace(ZWSP, ""))
+            suffix = desired[kept_logical:]
+        if backspaces == 0 and not suffix:
+            return True
+        typed = self._device.rewrite(backspaces, suffix)
+        if typed is None:
+            self._frozen = True  # some keys may have landed: state unknown
+            return False
+        self._screen = self._screen[:phys] + typed
         return True
+
+    def emit(self, text: str) -> bool:
+        """Append-only compatibility path (tracked so later syncs can fix it)."""
+        if not text:
+            return True
+        return self.sync(self._logical() + text)
+
+    def close(self) -> None:
+        self._device.close()
 
 
 def make_emitter(
@@ -186,19 +304,30 @@ def make_emitter(
     electron_workaround: bool = True,
     electron_classes: tuple[str, ...] | list[str] | None = None,
 ) -> Emitter:
-    """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null)."""
+    """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null).
+
+    The env override selects the *device* (useful for debugging: with
+    ``WL_DICTATE_EMIT=stdout`` correcting mode prints its rewrite ops); the
+    ``mode`` stays orthogonal — ``"correcting"`` wraps the device in a
+    :class:`CorrectingEmitter`, anything else returns the bare device.
+    """
     override = os.environ.get("WL_DICTATE_EMIT", "").strip().lower()
-    choice = override or mode
-    if choice in ("null", "none"):
-        return NullEmitter()
-    if choice == "stdout":
-        return StdoutEmitter()
-    kwargs: dict = dict(
-        timeout_s=wtype_timeout_s,
-        delay_ms=wtype_delay_ms,
-        press_delay_ms=wtype_press_delay_ms,
-        electron_workaround=electron_workaround,
-    )
-    if electron_classes is not None:
-        kwargs["electron_classes"] = electron_classes
-    return WtypeEmitter(**kwargs)
+    device_choice = override or ("wtype" if mode in ("commit", "correcting") else mode)
+    device: Emitter
+    if device_choice in ("null", "none"):
+        device = NullEmitter()
+    elif device_choice == "stdout":
+        device = StdoutEmitter()
+    else:
+        kwargs: dict = dict(
+            timeout_s=wtype_timeout_s,
+            delay_ms=wtype_delay_ms,
+            press_delay_ms=wtype_press_delay_ms,
+            electron_workaround=electron_workaround,
+        )
+        if electron_classes is not None:
+            kwargs["electron_classes"] = electron_classes
+        device = WtypeEmitter(**kwargs)
+    if mode == "correcting":
+        return CorrectingEmitter(device)
+    return device

@@ -128,6 +128,7 @@ def _run_session(
         max_buffer_s=cfg.streaming.max_buffer_s,
         min_speech_s=cfg.vad.min_speech_s,
         streaming_enabled=cfg.streaming.enabled,
+        correcting=cfg.typing.mode == "correcting",
         on_commit=lambda text: _emit("commit", text=text),
         on_error=lambda msg: _emit("error", msg=msg),
     )
