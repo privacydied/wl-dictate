@@ -58,6 +58,7 @@ class StreamingSession:
         emitter: Emitter,
         *,
         infer_interval_s: float = 0.5,
+        min_infer_interval_s: float | None = None,
         min_new_audio_s: float = 0.3,
         max_buffer_s: float = 12.0,
         min_speech_s: float = 0.3,
@@ -71,6 +72,11 @@ class StreamingSession:
         self._formatter = formatter
         self._emitter = emitter
         self._interval = infer_interval_s
+        # Adaptive cadence: with a floor set, the effective interval tracks
+        # 1.5x the measured decode time (fast model + short buffer -> tighter
+        # ticks; long buffer -> natural backoff). None = fixed interval.
+        self._min_interval = min_infer_interval_s
+        self._last_decode_duration = 0.0
         self._min_new = int(min_new_audio_s * SAMPLE_RATE)
         self._max_buffer = int(max_buffer_s * SAMPLE_RATE)
         self._min_speech = int(min_speech_s * SAMPLE_RATE)
@@ -82,6 +88,10 @@ class StreamingSession:
 
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="decode")
         self._inflight: tuple[Future, int] | None = None
+        # Speculative final decode started at the gate's "maybe ended" signal;
+        # (future, utterance_id). Valid only while the silence that triggered
+        # it continues (the gate cancels it if speech resumes).
+        self._speculative: tuple[Future, int] | None = None
 
         self._utterance_id = 0
         self._in_utterance = False
@@ -96,6 +106,7 @@ class StreamingSession:
         self._committed_text = ""  # raw committed text (prompt context)
         self._decoded_len = 0
         self._last_decode_t = self._clock()
+        self._speculative = None
         # Correcting-mode state:
         self._trimmed_raw = ""  # raw text of committed words trimmed from buffer
         self._last_raw = ""  # raw of the last rendered hypothesis
@@ -118,14 +129,22 @@ class StreamingSession:
 
     # ── Periodic work (call frequently from the session loop) ───────────
 
+    def _effective_interval(self) -> float:
+        if self._min_interval is None:
+            return self._interval
+        # Track the model's real speed: 1.5x decode time, floored and capped.
+        return min(self._interval, max(self._min_interval, self._last_decode_duration * 1.5))
+
     def tick(self) -> None:
         self._drain_inflight(block=False)
         if not (self._in_utterance and self._streaming_enabled):
             return
         if self._inflight is not None:
             return  # decode in flight: skip (backpressure)
+        if self._speculative is not None:
+            return  # final decode already speculating on this audio
         now = self._clock()
-        if now - self._last_decode_t < self._interval:
+        if now - self._last_decode_t < self._effective_interval():
             return
         if len(self._buffer) - self._decoded_len < self._min_new:
             return
@@ -135,36 +154,79 @@ class StreamingSession:
         self._decoded_len = len(audio)
         self._last_decode_t = now
         self._inflight = (
-            self._pool.submit(
-                self._transcriber.transcribe,
-                audio,
-                final=False,
-                prompt=self._prompt_tail(),
-            ),
+            self._submit_timed(audio, final=False),
             self._utterance_id,
         )
 
+    def _submit_timed(self, audio: np.ndarray, *, final: bool) -> Future:
+        """Submit a decode, recording its wall-clock duration for adaptivity."""
+        prompt = self._prompt_tail()
+
+        def run() -> list[Word]:
+            t0 = time.monotonic()
+            try:
+                return self._transcriber.transcribe(audio, final=final, prompt=prompt)
+            finally:
+                self._last_decode_duration = time.monotonic() - t0
+
+        return self._pool.submit(run)
+
+    # ── Speculative finalize ─────────────────────────────────────────────
+
+    def speculate_final(self) -> None:
+        """Start the final decode early (gate says the utterance probably
+        ended). If the silence holds, ``finalize`` uses this result and the
+        pause-to-final-text latency collapses to ~zero; if speech resumes the
+        gate cancels it and only some GPU time was wasted."""
+        if not self._in_utterance or self._speculative is not None:
+            return
+        if len(self._buffer) < self._min_speech and not self._committed:
+            return
+        self._drain_inflight(block=False)
+        self._speculative = (
+            self._submit_timed(self._buffer.copy(), final=True),
+            self._utterance_id,
+        )
+
+    def cancel_speculation(self) -> None:
+        """Speech resumed: the speculative final no longer covers the audio."""
+        self._speculative = None
+
     # ── Finalization ─────────────────────────────────────────────────────
 
-    def finalize(self) -> None:
-        """End the current utterance: final decode, commit everything."""
+    def finalize(self) -> str | None:
+        """End the current utterance: final decode, commit everything.
+
+        In correcting mode, returns the utterance's final emitted text
+        (including trailer) when it was successfully synced to the screen —
+        the input for a contextual transform. Returns None in commit mode and
+        on every path where the screen state is unknown or nothing was typed.
+        """
         if not self._in_utterance:
-            return
+            return None
         self._in_utterance = False
         self._drain_inflight(block=True)
 
         if len(self._buffer) < self._min_speech and not self._committed:
+            self._speculative = None
             self._reset_utterance_state()
-            return
+            return None
 
+        # Prefer the speculative final decode: it was started at the "maybe
+        # ended" silence point and covers all speech (the tail added since is
+        # silence by construction — speech would have cancelled it).
+        spec = self._speculative
+        self._speculative = None
+        words: list[Word] | None = None
+        if spec is not None and spec[1] == self._utterance_id:
+            try:
+                words = spec[0].result(timeout=_FINAL_DECODE_TIMEOUT_S)
+            except Exception:
+                words = None  # fall through to a fresh final decode
         try:
-            future = self._pool.submit(
-                self._transcriber.transcribe,
-                self._buffer,
-                final=True,
-                prompt=self._prompt_tail(),
-            )
-            words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
+            if words is None:
+                future = self._submit_timed(self._buffer, final=True)
+                words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
         except Exception as e:
             self._error(f"final decode failed: {e}")
             if self._correcting and self._last_raw:
@@ -174,10 +236,11 @@ class StreamingSession:
                 self._formatter.format_delta(self._last_raw)
                 self._formatter.end_utterance()
             self._reset_utterance_state()
-            return
+            return None
 
+        final_text: str | None = None
         if self._correcting:
-            self._finalize_correcting(words)
+            final_text = self._finalize_correcting(words)
         else:
             tail = words[len(self._committed) :]
             if tail:
@@ -186,18 +249,26 @@ class StreamingSession:
             if trailer and not self._emitter.emit(trailer):
                 self._error("emitter failed to type utterance trailer")
         self._reset_utterance_state()
+        return final_text
 
-    def _finalize_correcting(self, words: list[Word]) -> None:
-        """Replace the tentative tail with the final decode + trailer."""
+    def _finalize_correcting(self, words: list[Word]) -> str | None:
+        """Replace the tentative tail with the final decode + trailer.
+
+        Returns the synced final text, or None when the screen wasn't (or
+        couldn't be) updated — callers must not build on unknown screen state.
+        """
         raw = self._trimmed_raw + "".join(w.text for w in words)
         # The one state-mutating format of this utterance (peek never mutates).
         text = self._formatter.format_delta(raw) if raw.strip() else ""
+        synced = False
         trailer = self._formatter.end_utterance()
         if self._render_ok:
-            if not self._emitter.sync(text + trailer):
+            synced = self._emitter.sync(text + trailer)
+            if not synced:
                 self._error("emitter failed to sync final text")
         if text and self._on_commit is not None:
             self._on_commit(text + trailer)
+        return (text + trailer) if (text and synced) else None
 
     def stop(self) -> None:
         """Session teardown; finalizes any in-flight utterance first."""

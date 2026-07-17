@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# llama-server for wl-dictate contextual dictation (the default "local"
+# profile): Qwen3.5-9B with MTP speculative decoding for fast generation.
+#
+# - Small context: dictation transforms need ~16k, not the model's native
+#   window — smaller KV cache, faster prompt processing.
+# - MTP speculative decoding is the biggest generation-speed multiplier when
+#   acceptance is high. Watch the acceptance rate in --metrics: high -> bump
+#   MTP_DRAFT_MAX to 5-6+, low -> lower it.
+# - Pairs with config.json: contextual.profile = "local",
+#   profiles.local.base_url = http://127.0.0.1:8890/v1 (alias must match).
+set -euo pipefail
+
+export HF_HOME="${HF_HOME:-/mnt/SSD2/hf-cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+# Batch-1 generation is faster with MMQ (no fp16 dequant); cuBLAS only wins
+# on big prompt batches.
+export GGML_CUDA_FORCE_MMQ=1
+
+PORT="${PORT:-8890}"
+CTX_SIZE="${CTX_SIZE:-16384}"
+MTP_DRAFT_MAX="${MTP_DRAFT_MAX:-11}"
+
+llama-server \
+  -hf unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M \
+  --host 127.0.0.1 \
+  --port "${PORT}" \
+  --alias qwen3.5-9b \
+  --no-mmproj \
+  -ngl all \
+  --ctx-size "${CTX_SIZE}" \
+  --parallel 1 \
+  --flash-attn on \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --kv-offload \
+  --jinja \
+  --cache-prompt \
+  --cache-reuse 1024 \
+  --reasoning off \
+  --reasoning-budget 0 \
+  --temp 1 --top-p 0.8 --top-k 20 --min-p 0.0 \
+  --metrics \
+  --spec-type draft-mtp \
+  --spec-draft-n-max "${MTP_DRAFT_MAX}" \
+  --spec-draft-n-min 0

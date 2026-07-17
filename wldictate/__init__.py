@@ -1,3 +1,3 @@
 """wl-dictate — realtime voice dictation for Linux Wayland/X11."""
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

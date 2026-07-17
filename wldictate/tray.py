@@ -106,7 +106,8 @@ class DictationTrayApp:
         self._log_lock = threading.Lock()
         self._log_file = None
         self._worker_ready = False
-        self.is_dictating = False
+        self._active_mode: str | None = None  # None | "standard" | "contextual"
+        self._hold_session = False  # current session was started by push-to-talk
         self._listening_notified = False
         self._cleaned = False
         self._shutting_down = False
@@ -131,7 +132,13 @@ class DictationTrayApp:
         self.device_menu = self.menu.addMenu("Input Device")
         self.reload_devices()
         self.toggle_action = self.menu.addAction("Toggle Dictation")
-        self.toggle_action.triggered.connect(self.toggle_dictation)
+        # Lambdas: QAction.triggered passes a bool ("checked") to direct slots,
+        # which would be swallowed by the mode parameter.
+        self.toggle_action.triggered.connect(lambda: self.toggle_dictation("standard"))
+        self.toggle_contextual_action = self.menu.addAction("Toggle Contextual")
+        self.toggle_contextual_action.triggered.connect(
+            lambda: self.toggle_dictation("contextual")
+        )
         self.reload_action = self.menu.addAction("Reload Devices")
         self.reload_action.triggered.connect(self.reload_devices)
         self.quit_action = self.menu.addAction("Quit")
@@ -179,7 +186,15 @@ class DictationTrayApp:
             except OSError:
                 pass
         if data == "toggle":
-            self.toggle_dictation()
+            self.toggle_dictation("standard")
+        elif data == "toggle-contextual":
+            self.toggle_dictation("contextual")
+        elif data == "hold-start":
+            self.hold_start("standard")
+        elif data == "hold-start-contextual":
+            self.hold_start("contextual")
+        elif data == "hold-stop":
+            self.hold_stop()
 
     @staticmethod
     def _peer_is_same_user(conn: socket.socket) -> bool:
@@ -202,16 +217,15 @@ class DictationTrayApp:
     def _is_compiled(self) -> bool:
         return "__compiled__" in globals() or getattr(sys, "frozen", False)
 
-    def _get_toggle_command(self) -> str:
+    def _get_toggle_command(self, flag: str = "--toggle") -> str:
         if self._is_compiled():
-            return sys.executable + " --toggle"
+            return f"{sys.executable} {flag}"
         entry = Path(self.script_dir) / "wl_dictate.py"
-        return f"{sys.executable} {entry} --toggle"
+        return f"{sys.executable} {entry} {flag}"
 
     def _ensure_wayland_hotkey_binding(self) -> None:
         if os.environ.get("XDG_CURRENT_DESKTOP") != "Hyprland":
             return
-        toggle_command = self._get_toggle_command()
         try:
             import json as _json
 
@@ -221,31 +235,62 @@ class DictationTrayApp:
             binds = _json.loads(result.stdout)
         except Exception:
             return
+        # Standard dictation: Ctrl+Alt+F; contextual: Ctrl+Alt+D. An existing
+        # bind on either combo — ours (any interpreter path) or the user's own
+        # — is left untouched: installing on top of our own produces a
+        # DUPLICATE bind (every keypress fires twice: start then stop), and a
+        # foreign bind must not be clobbered.
+        self._ensure_bind(
+            binds,
+            key="f",
+            command=self._get_toggle_command("--toggle"),
+            label="Ctrl+Alt+F dictation toggle",
+        )
+        self._ensure_bind(
+            binds,
+            key="d",
+            command=self._get_toggle_command("--toggle-contextual"),
+            label="Ctrl+Alt+D contextual dictation toggle",
+        )
+        # Push-to-talk: hold Ctrl+Alt+Tab to talk; release finalizes
+        # immediately (no silence-detection wait). Press+release bind pair.
+        self._ensure_bind(
+            binds,
+            key="tab",
+            command=self._get_toggle_command("--hold-start"),
+            label="Ctrl+Alt+Tab push-to-talk",
+        )
+        self._ensure_bind(
+            binds,
+            key="tab",
+            command=self._get_toggle_command("--hold-stop"),
+            release=True,
+            label=None,  # one notification for the pair is enough
+        )
 
-        conflicting_bind = None
+    def _ensure_bind(self, binds, *, key, command, label, release=False) -> None:
+        """Install one Ctrl+Alt+<key> runtime bind unless the combo is taken.
+
+        modmask 12 = CTRL(4) | ALT(8). ``release`` installs a ``bindr``
+        (fires on key release) and only considers existing release binds
+        when checking whether the combo is taken.
+        """
         for bind in binds:
-            if bind.get("key", "").lower() != "f":
+            if bind.get("key", "").lower() != key:
                 continue
             if bind.get("modmask") != 12:
                 continue
-            arg = bind.get("arg", "")
-            # Any Ctrl+Alt+F bind that already toggles dictation is good enough,
-            # regardless of the exact interpreter path ("python" vs "python3")
-            # or entry point. Installing our own on top produces a DUPLICATE
-            # bind, so every keypress fires twice (start immediately followed by
-            # stop). Leave an existing toggle bind untouched.
-            if "toggle_dictation" in arg or "--toggle" in arg:
-                return
-            conflicting_bind = bind
-
-        if conflicting_bind is not None:
-            return
+            if bool(bind.get("release")) != release:
+                continue
+            return  # combo taken (see caller comment)
+        keyword = "bindr" if release else "bind"
         bind_result = self._run_hyprctl(
-            "keyword", "bind", f"CTRL ALT, F, exec, {toggle_command}"
+            "keyword", keyword, f"CTRL ALT, {key.upper()}, exec, {command}"
         )
         if bind_result.returncode != 0:
             return
-        notify("Installed Hyprland Ctrl+Alt+F dictation toggle")
+        if label:
+            notify(f"Installed Hyprland {label}")
 
     # ── Worker lifecycle ─────────────────────────────────────────────────
 
@@ -288,13 +333,17 @@ class DictationTrayApp:
         self._worker_monitor.start()
 
     def _send_worker_command(
-        self, cmd: str, device: int | None = None, device_name: str | None = None
+        self,
+        cmd: str,
+        device: int | None = None,
+        device_name: str | None = None,
+        mode: str | None = None,
     ) -> None:
         if not self.worker_process or self.worker_process.stdin is None:
             raise RuntimeError("dictation worker is not running")
         try:
             self.worker_process.stdin.write(
-                ipc.format_command(cmd, device, device_name) + "\n"
+                ipc.format_command(cmd, device, device_name, mode=mode) + "\n"
             )
             self.worker_process.stdin.flush()
         except (BrokenPipeError, OSError) as e:
@@ -336,7 +385,7 @@ class DictationTrayApp:
             return
         was_dictating = self.is_dictating
         if was_dictating:
-            self.is_dictating = False
+            self._active_mode = None
             self.set_icon(False)
         # Killed by our own terminate/quit (negative signals) during normal
         # stop is fine; anything else during operation triggers a restart.
@@ -471,17 +520,44 @@ class DictationTrayApp:
 
     # ── Dictation control ────────────────────────────────────────────────
 
+    @property
+    def is_dictating(self) -> bool:
+        return self._active_mode is not None
+
     def on_icon_click(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:
-            self.toggle_dictation()
+            self.toggle_dictation("standard")
 
-    def toggle_dictation(self) -> None:
-        if self.is_dictating:
+    def toggle_dictation(self, mode: str = "standard") -> None:
+        if not isinstance(mode, str):  # defensive: Qt slots pass bools
+            mode = "standard"
+        if self._active_mode == mode:
             self.stop_dictation()
+        elif self._active_mode is not None:
+            # Other mode active: switch. The worker command loop processes the
+            # stop (which joins the session thread) before the new start.
+            self.stop_dictation()
+            self.start_dictation(mode)
         else:
-            self.start_dictation()
+            self.start_dictation(mode)
 
-    def start_dictation(self) -> None:
+    def hold_start(self, mode: str = "standard") -> None:
+        """Push-to-talk press: start dictating (no-op if already active)."""
+        if self._active_mode == mode:
+            return  # already listening (e.g. toggle mode): key repeat etc.
+        if self._active_mode is not None:
+            self.stop_dictation()
+        self.start_dictation(mode)
+        self._hold_session = self.is_dictating
+
+    def hold_stop(self) -> None:
+        """Push-to-talk release: stop; the worker finalizes immediately —
+        no 500ms silence wait, releasing the key IS the end signal."""
+        if getattr(self, "_hold_session", False):
+            self._hold_session = False
+            self.stop_dictation()
+
+    def start_dictation(self, mode: str = "standard") -> None:
         if self.is_dictating:
             return
         try:
@@ -490,16 +566,19 @@ class DictationTrayApp:
                 notify(notice or "No working input device is available.")
                 return
             self._write_worker_log(
-                f"\n--- dictation started at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"\n--- dictation started ({mode}) at {time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"(device {device_idx}: {device_info.get('name', 'unknown')}) ---\n"
             )
             was_ready = self._worker_ready
             self._ensure_worker_process()
             self._listening_notified = False
             self._send_worker_command(
-                "start", device_idx, device_info.get("name") if device_info else None
+                "start",
+                device_idx,
+                device_info.get("name") if device_info else None,
+                mode=mode,
             )
-            self.is_dictating = True
+            self._active_mode = mode
             self.set_icon(True)
             if notice:
                 notify(notice)
@@ -511,7 +590,8 @@ class DictationTrayApp:
     def stop_dictation(self, during_cleanup: bool = False) -> None:
         if not self.is_dictating:
             return
-        self.is_dictating = False
+        self._active_mode = None
+        self._hold_session = False
         self._listening_notified = False
         if self.worker_process and self.worker_process.poll() is None:
             try:
@@ -539,6 +619,8 @@ class DictationTrayApp:
             QIcon(self._resource_path("mic-on.png" if active else "mic-off.png"))
         )
         status = "ON" if active else "OFF"
+        if active and self._active_mode == "contextual":
+            status += " (contextual)"
         device = (
             f" ({self.config.input_device})"
             if self.config.input_device is not None

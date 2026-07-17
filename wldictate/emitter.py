@@ -13,6 +13,7 @@ import glob
 import os
 import subprocess
 import sys
+import threading
 from abc import ABC, abstractmethod
 
 #: Zero-width space — invisible gate-opener for Electron's leading-space drop.
@@ -21,6 +22,17 @@ ZWSP = "​"
 #: Safety cap on backspaces per sync: a pathological diff rewrites at most the
 #: last N physical characters instead of machine-gunning the whole utterance.
 _MAX_BACKSPACES = 500
+
+#: Bulk rewrites at/above this many typed characters go through the clipboard
+#: paste fast-path (where the focused app supports Ctrl+V paste): ~6ms/char
+#: keystroking turns a 200-char LLM replacement into >1s of visible churn;
+#: paste is one keystroke.
+_PASTE_MIN_CHARS = 120
+
+#: How long after Ctrl+V before the previous clipboard is restored. Paste
+#: consumers read the clipboard when handling the paste event; restoring too
+#: early races them.
+_CLIPBOARD_RESTORE_DELAY_S = 0.4
 
 
 class Emitter(ABC):
@@ -36,6 +48,11 @@ class Emitter(ABC):
         that cannot delete just emit the text (best effort).
         """
         return text if self.emit(text) else None
+
+    def rewrite_bulk(self, backspaces: int, text: str) -> str | None:
+        """Like ``rewrite`` but for large one-shot replacements; devices may
+        use a faster delivery (clipboard paste). Default: plain rewrite."""
+        return self.rewrite(backspaces, text)
 
     def close(self) -> None:  # pragma: no cover - default no-op
         pass
@@ -90,6 +107,28 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
             return
 
 
+def focused_window(env: dict[str, str]) -> tuple[str, str]:
+    """(class, title) of the focused window; ("", "") if unknown/not Hyprland."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "activewindow"],
+            env=env,
+            timeout=1.0,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return "", ""
+        import json
+
+        data = json.loads(result.stdout)
+        cls = str(data.get("class") or data.get("initialClass") or "")
+        title = str(data.get("title") or "")
+        return cls, title
+    except Exception:
+        return "", ""
+
+
 class WtypeEmitter(Emitter):
     """Types text into the focused window with wtype."""
 
@@ -127,22 +166,7 @@ class WtypeEmitter(Emitter):
 
     def _focused_window_class(self) -> str:
         """Window class of the focused window ("" if unknown / not Hyprland)."""
-        try:
-            result = subprocess.run(
-                ["hyprctl", "-j", "activewindow"],
-                env=self._env,
-                timeout=1.0,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                return ""
-            import json
-
-            data = json.loads(result.stdout)
-            return str(data.get("class") or data.get("initialClass") or "")
-        except Exception:
-            return ""
+        return focused_window(self._env)[0]
 
     def _needs_electron_gate(self, text: str) -> bool:
         """True when the leading space of ``text`` would be eaten by the
@@ -222,6 +246,73 @@ class WtypeEmitter(Emitter):
             return None
         return text
 
+    def rewrite_bulk(self, backspaces: int, text: str) -> str | None:
+        """Large replacement: clipboard + Ctrl+V where the app supports it.
+
+        Only used for Electron/Chromium apps (slowest to keystroke into AND
+        reliably Ctrl+V-pasteable). Terminals/editors keep plain keystroking:
+        Ctrl+V is not paste there. The previous clipboard is restored shortly
+        after the paste lands. Falls back to plain rewrite on any failure.
+        """
+        if len(text) < _PASTE_MIN_CHARS or not self._electron_workaround:
+            return self.rewrite(backspaces, text)
+        focused = self._focused_window_class().lower()
+        if not focused or not any(cls in focused for cls in self._electron_classes):
+            return self.rewrite(backspaces, text)
+
+        previous = self._read_clipboard()
+        if not self._write_clipboard(text):
+            return self.rewrite(backspaces, text)
+        cmd = ["wtype"]
+        if self._press_delay_ms > 0:
+            cmd += ["-s", str(self._press_delay_ms)]
+        for _ in range(max(0, backspaces)):
+            if self._delay_ms > 0:
+                cmd += ["-s", str(self._delay_ms)]
+            cmd += ["-k", "BackSpace"]
+        cmd += ["-s", str(max(10, self._delay_ms)), "-M", "ctrl", "-k", "v", "-m", "ctrl"]
+        try:
+            result = subprocess.run(
+                cmd, env=self._env, timeout=self._timeout, capture_output=True, text=True
+            )
+            ok = result.returncode == 0
+        except Exception as e:
+            print(f"wtype paste failed: {e}", file=sys.stderr)
+            ok = False
+        if previous is not None:
+            timer = threading.Timer(
+                _CLIPBOARD_RESTORE_DELAY_S, self._write_clipboard, args=(previous,)
+            )
+            timer.daemon = True
+            timer.start()
+        if not ok:
+            return None  # backspaces may have landed: caller treats as failure
+        return text
+
+    def _read_clipboard(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["wl-paste", "--no-newline"],
+                env=self._env,
+                timeout=1.0,
+                capture_output=True,
+                text=True,
+                errors="replace",
+            )
+            return result.stdout if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _write_clipboard(self, text: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["wl-copy"], input=text, env=self._env, timeout=1.0, capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
 
 class CorrectingEmitter(Emitter):
     """Rewrites tentative text in place (live self-correcting mode).
@@ -247,10 +338,24 @@ class CorrectingEmitter(Emitter):
     def _logical(self) -> str:
         return self._screen.replace(ZWSP, "")
 
-    def sync(self, desired: str) -> bool:
-        """Make the screen show ``desired`` (for this utterance's region)."""
+    def sync(
+        self,
+        desired: str,
+        *,
+        max_backspaces: int | None = None,
+        bulk: bool = False,
+    ) -> bool:
+        """Make the screen show ``desired`` (for this utterance's region).
+
+        ``max_backspaces`` overrides the default safety cap — the contextual
+        transform passes a large budget so a full-utterance replacement is
+        never truncated (live decodes keep the tight default: a pathological
+        mid-stream diff is recoverable by the next decode). ``bulk`` marks a
+        one-shot replacement eligible for the device's paste fast-path.
+        """
         if self._frozen:
             return False
+        cap = _MAX_BACKSPACES if max_backspaces is None else max_backspaces
         logical = self._logical()
         # Longest common prefix (logical view — ZWSPs are invisible).
         p = 0
@@ -269,16 +374,19 @@ class CorrectingEmitter(Emitter):
             phys += 1
         backspaces = len(self._screen) - phys
         suffix = desired[p:]
-        if backspaces > _MAX_BACKSPACES:
+        if backspaces > cap:
             # Pathological rewrite: keep the (possibly wrong) older prefix and
-            # rewrite only the last _MAX_BACKSPACES physical chars.
-            phys = len(self._screen) - _MAX_BACKSPACES
-            backspaces = _MAX_BACKSPACES
+            # rewrite only the last ``cap`` physical chars.
+            phys = len(self._screen) - cap
+            backspaces = cap
             kept_logical = len(self._screen[:phys].replace(ZWSP, ""))
             suffix = desired[kept_logical:]
         if backspaces == 0 and not suffix:
             return True
-        typed = self._device.rewrite(backspaces, suffix)
+        if bulk:
+            typed = self._device.rewrite_bulk(backspaces, suffix)
+        else:
+            typed = self._device.rewrite(backspaces, suffix)
         if typed is None:
             self._frozen = True  # some keys may have landed: state unknown
             return False

@@ -138,3 +138,11 @@ def test_emit_appends_and_is_tracked():
     assert dev.ops == [(0, "hello"), (0, " world")]
     ce.sync("hello word")
     assert dev.ops[-1] == (2, "d")
+
+
+def test_max_backspaces_override_allows_full_replacement():
+    ce, dev = make()
+    ce.sync("a" * 700)
+    # Default cap would clamp at 500; the transform path passes a big budget.
+    assert ce.sync("b" * 3, max_backspaces=4000)
+    assert dev.ops[-1] == (700, "bbb")

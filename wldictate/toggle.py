@@ -15,7 +15,8 @@ def _candidate_sockets() -> list[Path]:
     return [socket_path(), *legacy_socket_paths()]
 
 
-def main() -> int:
+def main(verb: str = "toggle") -> int:
+    """Send a toggle verb ("toggle" | "toggle-contextual") to the tray."""
     last_error: Exception | None = None
     for path in _candidate_sockets():
         if not os.path.exists(path):
@@ -24,7 +25,7 @@ def main() -> int:
         try:
             sock.settimeout(1.0)
             sock.connect(str(path))
-            sock.sendall(b"toggle")
+            sock.sendall(verb.encode())
             return 0
         except OSError as e:
             last_error = e

@@ -238,3 +238,46 @@ def test_emit_refactor_keeps_argv_and_reports_failure(monkeypatch):
     assert WtypeEmitter(delay_ms=6, press_delay_ms=40).emit("hi") is True
     cmd, _ = cap.calls[0]
     assert cmd == ["wtype", "-s", "40", "-d", "6", "-"]
+
+
+# ── paste fast-path (rewrite_bulk) ───────────────────────────────────────────
+
+LONG = "x" * 200  # above _PASTE_MIN_CHARS
+
+
+def test_bulk_paste_in_electron_uses_clipboard_and_ctrl_v(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    e = WtypeEmitter(delay_ms=6)
+    monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
+    assert e.rewrite_bulk(2, LONG) == LONG
+    cmds = [c for c, _ in cap.calls]
+    # wl-paste (save), wl-copy (set), wtype (backspaces + Ctrl+V)
+    assert cmds[0][0] == "wl-paste"
+    assert cmds[1][0] == "wl-copy"
+    wtype_cmd, wtype_kwargs = cap.calls[2]
+    assert wtype_cmd[0] == "wtype"
+    assert wtype_cmd.count("BackSpace") == 2
+    assert wtype_cmd[-6:] == ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
+    assert "-" not in wtype_cmd  # no keystroked text: it goes via clipboard
+    _, copy_kwargs = cap.calls[1]
+    assert copy_kwargs["input"] == LONG
+
+
+def test_bulk_falls_back_to_typing_outside_electron(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    e = WtypeEmitter(delay_ms=0)
+    monkeypatch.setattr(e, "_focused_window_class", lambda: "kitty")
+    assert e.rewrite_bulk(1, LONG) == LONG
+    cmds = [c for c, _ in cap.calls]
+    assert all(c[0] == "wtype" for c in cmds)  # plain rewrite path
+
+
+def test_bulk_short_text_always_types(monkeypatch):
+    cap = _Capture()
+    monkeypatch.setattr(subprocess, "run", cap)
+    e = WtypeEmitter(delay_ms=0)
+    monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
+    e.rewrite_bulk(0, "short")
+    assert all(c[0] == "wtype" for c, _ in cap.calls)

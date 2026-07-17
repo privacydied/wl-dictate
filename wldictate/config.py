@@ -70,9 +70,15 @@ def _legacy_config_paths() -> list[Path]:
 @dataclass
 class StreamingConfig:
     enabled: bool = True
+    # Maximum re-decode cadence; the effective cadence adapts down to
+    # min_infer_interval_s when the model decodes fast (1.5x measured decode
+    # time), so short utterances on a fast GPU tick tighter than this.
     infer_interval_s: float = 0.5
+    min_infer_interval_s: float = 0.25
     min_new_audio_s: float = 0.3
-    max_buffer_s: float = 12.0
+    # Committed audio is trimmed out of the buffer beyond this: smaller
+    # windows decode faster (every tick re-decodes the whole window).
+    max_buffer_s: float = 8.0
 
 
 @dataclass
@@ -82,6 +88,11 @@ class VadConfig:
     offset: float = 0.35
     onset_frames: int = 2
     min_silence_ms: int = 500
+    # Speculative finalize: start the final decode after this much silence
+    # (while still counting toward min_silence_ms). If the pause holds, the
+    # final text lands the instant the utterance ends; if you resume speaking,
+    # the speculative decode is discarded. 0 disables.
+    speculative_silence_ms: int = 200
     pre_roll_ms: int = 320
     min_speech_s: float = 0.3
     max_utterance_s: float = 28.0
@@ -131,6 +142,143 @@ class TypingConfig:
 
 
 @dataclass
+class ContextualProfile:
+    """One LLM endpoint for contextual dictation.
+
+    backend "openai" is any OpenAI-compatible server (local llama.cpp
+    llama-server, OpenRouter, ...); backend "anthropic" uses the official
+    Anthropic SDK. The API key is read from ``api_key_file`` (preferred —
+    systemd-friendly; ``~`` is expanded) or the ``api_key_env`` environment
+    variable. Both empty means no key (fine for a local server).
+    """
+
+    backend: str = "openai"  # openai (OpenAI-compatible) | anthropic
+    base_url: str = ""  # unused for the anthropic backend
+    model: str = ""
+    api_key_env: str = ""
+    api_key_file: str = ""
+
+
+def _default_contextual_profiles() -> dict[str, ContextualProfile]:
+    return {
+        "local": ContextualProfile(
+            backend="openai",
+            base_url="http://127.0.0.1:8890/v1",
+            model="qwen3.5-9b",  # matches scripts/llama-contextual.sh --alias
+        ),
+        "openrouter": ContextualProfile(
+            backend="openai",
+            base_url="https://openrouter.ai/api/v1",
+            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            api_key_env="OPENAI_API_KEY",
+            api_key_file="~/.config/wl-dictate/openrouter.key",
+        ),
+        "anthropic": ContextualProfile(
+            backend="anthropic",
+            # claude-haiku-4-5: latency-appropriate for per-utterance
+            # dictation transforms; change to any Claude model id.
+            model="claude-haiku-4-5",
+            api_key_env="ANTHROPIC_API_KEY",
+            api_key_file="~/.config/wl-dictate/anthropic.key",
+        ),
+    }
+
+
+@dataclass
+class ContextualConfig:
+    """Contextual dictation (Ctrl+Alt+D): LLM transform of each utterance."""
+
+    profile: str = "local"  # key into profiles — switching endpoints is one field
+    timeout_s: float = 10.0  # whole LLM budget; on timeout the Whisper text stays
+    max_output_tokens: int = 1000
+    context_max_chars: int = 4000  # per-source cap for selection/clipboard
+    notify: bool = True  # "Transforming…" / error toasts via notify-send
+    profiles: dict[str, ContextualProfile] = field(
+        default_factory=_default_contextual_profiles
+    )
+
+    # dict[str, dataclass] doesn't fit Config's generic scalar (de)serializer,
+    # so this section owns its own round-trip (special-cased in Config).
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "profile": self.profile,
+            "timeout_s": self.timeout_s,
+            "max_output_tokens": self.max_output_tokens,
+            "context_max_chars": self.context_max_chars,
+            "notify": self.notify,
+            "profiles": {name: dict(vars(p)) for name, p in self.profiles.items()},
+        }
+        return out
+
+    def apply_dict(self, raw: dict[str, Any], warnings: list[str]) -> None:
+        """Merge a user-provided section over the defaults, with type checks."""
+        scalar_types = {
+            "profile": str,
+            "timeout_s": (int, float),
+            "max_output_tokens": int,
+            "context_max_chars": int,
+            "notify": bool,
+        }
+        for key, value in raw.items():
+            if key == "profiles":
+                if not isinstance(value, dict):
+                    warnings.append("invalid contextual.profiles; keeping defaults")
+                    continue
+                for name, profile_raw in value.items():
+                    if not isinstance(name, str) or not isinstance(profile_raw, dict):
+                        warnings.append(
+                            f"invalid contextual profile entry {name!r}; ignored"
+                        )
+                        continue
+                    profile = self.profiles.setdefault(name, ContextualProfile())
+                    for p_key, p_value in profile_raw.items():
+                        if p_key not in vars(profile):
+                            warnings.append(
+                                f"unknown config key ignored: contextual.profiles.{name}.{p_key}"
+                            )
+                        elif isinstance(p_value, str):
+                            setattr(profile, p_key, p_value)
+                        else:
+                            warnings.append(
+                                f"invalid value for contextual.profiles.{name}.{p_key};"
+                                " keeping default"
+                            )
+                continue
+            if key not in scalar_types:
+                warnings.append(f"unknown config key ignored: contextual.{key}")
+                continue
+            expected = scalar_types[key]
+            ok = isinstance(value, expected)
+            if key != "notify" and isinstance(value, bool):
+                ok = False  # bool is an int subclass; reject for numeric fields
+            if ok:
+                if key == "timeout_s":
+                    value = float(value)
+                setattr(self, key, value)
+            else:
+                warnings.append(f"invalid value for contextual.{key}; keeping default")
+
+    def validate(self, warnings: list[str]) -> None:
+        if self.profile not in self.profiles:
+            warnings.append(
+                f"unknown contextual.profile '{self.profile}'; using 'local'"
+            )
+            self.profile = "local"
+            self.profiles.setdefault("local", _default_contextual_profiles()["local"])
+        if not (0.5 <= self.timeout_s <= 60.0):
+            warnings.append("contextual.timeout_s out of range [0.5, 60]; using 10")
+            self.timeout_s = 10.0
+        for name, profile in self.profiles.items():
+            if profile.backend not in ("openai", "anthropic"):
+                warnings.append(
+                    f"invalid backend '{profile.backend}' in contextual profile"
+                    f" '{name}'; using 'openai'"
+                )
+                profile.backend = "openai"
+
+
+@dataclass
 class AudioConfig:
     # Keep the microphone stream open across dictation toggles. Opening and
     # closing a USB mic renegotiates isochronous bandwidth on its USB
@@ -154,6 +302,8 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     typing: TypingConfig = field(default_factory=TypingConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    # Special-cased in to_dict/from_dict (owns its own round-trip).
+    contextual: ContextualConfig = field(default_factory=ContextualConfig)
 
     # Populated by load(); not serialized.
     warnings: list[str] = field(default_factory=list, repr=False)
@@ -177,6 +327,7 @@ class Config:
         }
         for name in self._NESTED:
             out[name] = dict(vars(getattr(self, name)))
+        out["contextual"] = self.contextual.to_dict()
         return out
 
     @classmethod
@@ -226,7 +377,12 @@ class Config:
                 cfg.warnings.append(f"invalid value for {path}; keeping default")
 
         for key, value in raw.items():
-            if key in cls._NESTED:
+            if key == "contextual":
+                if isinstance(value, dict):
+                    cfg.contextual.apply_dict(value, cfg.warnings)
+                else:
+                    cfg.warnings.append("invalid section contextual; keeping defaults")
+            elif key in cls._NESTED:
                 if not isinstance(value, dict):
                     cfg.warnings.append(f"invalid section {key}; keeping defaults")
                     continue
@@ -260,13 +416,22 @@ class Config:
         if not (0.1 <= s.infer_interval_s <= 5.0):
             self.warnings.append("streaming.infer_interval_s out of range [0.1, 5]; using 0.5")
             s.infer_interval_s = 0.5
+        if not (0.1 <= s.min_infer_interval_s <= s.infer_interval_s):
+            self.warnings.append(
+                "streaming.min_infer_interval_s out of range; using infer_interval_s"
+            )
+            s.min_infer_interval_s = s.infer_interval_s
         if not (2.0 <= s.max_buffer_s <= 30.0):
-            self.warnings.append("streaming.max_buffer_s out of range [2, 30]; using 12")
-            s.max_buffer_s = 12.0
+            self.warnings.append("streaming.max_buffer_s out of range [2, 30]; using 8")
+            s.max_buffer_s = 8.0
+        if self.vad.speculative_silence_ms < 0:
+            self.warnings.append("vad.speculative_silence_ms negative; using 200")
+            self.vad.speculative_silence_ms = 200
         v = self.vad
         if not (0.0 < v.offset <= v.onset <= 1.0):
             self.warnings.append("vad onset/offset invalid; using defaults")
             v.onset, v.offset = 0.5, 0.35
+        self.contextual.validate(self.warnings)
 
     # ── Load/save ────────────────────────────────────────────────────────
 

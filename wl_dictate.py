@@ -3,11 +3,13 @@
 Usage (source):
     python wl_dictate.py              # tray app
     python wl_dictate.py --worker     # dictation worker (spawned by the tray)
-    python wl_dictate.py --toggle     # toggle dictation via Unix socket
+    python wl_dictate.py --toggle     # toggle standard dictation via Unix socket
+    python wl_dictate.py --toggle-contextual  # toggle contextual (LLM) dictation
+    python wl_dictate.py --hold-start[-contextual] / --hold-stop  # push-to-talk
     python wl_dictate.py --devices    # list input devices
 
 Usage (compiled binary):
-    wl-dictate [--worker|--toggle|--devices]
+    wl-dictate [--worker|--toggle|--toggle-contextual|--devices]
 """
 
 from __future__ import annotations
@@ -62,6 +64,18 @@ def main() -> None:
         from wldictate.toggle import main as toggle_main
 
         sys.exit(toggle_main())
+
+    elif args and args[0] == "--toggle-contextual":
+        from wldictate.toggle import main as toggle_main
+
+        sys.exit(toggle_main("toggle-contextual"))
+
+    elif args and args[0] in ("--hold-start", "--hold-start-contextual", "--hold-stop"):
+        # Push-to-talk: bind press -> --hold-start, release (bindr) ->
+        # --hold-stop. Release finalizes immediately (no VAD silence wait).
+        from wldictate.toggle import main as toggle_main
+
+        sys.exit(toggle_main(args[0].lstrip("-")))
 
     elif args and args[0] == "--devices":
         from wldictate.audio import list_input_devices

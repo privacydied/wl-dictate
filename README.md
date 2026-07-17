@@ -32,6 +32,7 @@ Decodes run on a single background thread; if a decode is still in flight when t
   - `transcriber.py` — faster-whisper backend behind a swappable interface
   - `textproc.py` — incremental transcript cleanup and spacing
   - `emitter.py` — wtype typing + the backspace-correcting emitter (plus stdout/null emitters for testing)
+  - `transform.py` — contextual dictation: screen-context capture, LLM backends (OpenAI-compatible + Anthropic), transform coordinator
   - `config.py` / `ipc.py` / `notify.py` / `toggle.py`
 - `toggle_dictation.py` — compat shim for existing keybinds (`wl_dictate.py --toggle` is equivalent)
 - `hotkey_listener.py` — legacy raw-evdev listener (off the main path)
@@ -47,12 +48,41 @@ Two long-lived processes:
    - toggle socket at `$XDG_RUNTIME_DIR/wl-dictate.sock` (same-user check via `SO_PEERCRED`)
    - prewarms the worker at startup, **auto-restarts it with backoff if it dies**
    - tees worker output to `~/.local/state/wl-dictate/worker.log`
-   - repairs/installs a Hyprland `Ctrl+Alt+F` runtime bind when possible
+   - repairs/installs Hyprland runtime binds when possible: `Ctrl+Alt+F` (standard toggle), `Ctrl+Alt+D` (contextual toggle), and `Ctrl+Alt+Tab` (push-to-talk: hold to speak, release finalizes **immediately** — no silence-detection wait)
 
 2. **Worker** (`wl_dictate.py --worker`)
    - loads faster-whisper once (default `small.en`, CUDA float16, CPU int8 fallback) and warms it up
    - JSON-lines protocol on stdin/stdout: `{"cmd": "start", "device": 3}` in, `{"ev": "commit", "text": "..."}` out
    - streams transcription as described above
+
+## Contextual dictation (Ctrl+Alt+D)
+
+A second dictation mode inspired by heyclicky-style contextual dictation. You speak; raw words appear instantly and self-correct exactly like standard dictation — then, when you pause, the whole utterance is **rewritten in place by an LLM** that sees lightweight screen context: the focused window's class and title, the primary selection, and the clipboard (text only — no screenshots).
+
+- Plain dictation gets cleaned up (grammar, punctuation) in the register of the focused app — terse in a terminal, casual in Discord, prose in email.
+- Spoken **instructions about text are executed**, not transcribed: select a message and say "reply to this saying I can't make it tonight" and the reply is what gets typed.
+- If the LLM is down, slow, or misconfigured, **you lose nothing**: the dictated text is already on screen and simply stays.
+
+Three endpoint profiles ship in `contextual.profiles`; switching is the single `contextual.profile` field:
+
+| profile | backend | endpoint | model |
+|---|---|---|---|
+| `local` (default) | OpenAI-compatible | `http://127.0.0.1:8890/v1` (llama.cpp) | `qwen3.5-9b` |
+| `openrouter` | OpenAI-compatible | `https://openrouter.ai/api/v1` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` |
+| `anthropic` | Anthropic SDK | api.anthropic.com | `claude-haiku-4-5` |
+
+**Local model**: `scripts/llama-contextual.sh` launches `llama-server` with Qwen3.5-9B and MTP speculative decoding (fast generation) on port 8890 — no API key needed. Watch the MTP acceptance rate in `--metrics` and tune `MTP_DRAFT_MAX`.
+
+**API keys** (cloud profiles): the key file is the systemd-friendly path —
+
+```sh
+echo sk-or-... > ~/.config/wl-dictate/openrouter.key && chmod 600 ~/.config/wl-dictate/openrouter.key
+echo sk-ant-... > ~/.config/wl-dictate/anthropic.key && chmod 600 ~/.config/wl-dictate/anthropic.key
+```
+
+or set the env var (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) via a systemd drop-in (`systemctl --user edit wl-dictate.service` → `[Service]` `Environment=OPENAI_API_KEY=...`). The file wins if both exist.
+
+Semantics worth knowing: the transform runs per utterance after you pause; if you start speaking again before it returns, that utterance's transform is cancelled and the raw text stays (nothing is ever rewritten underneath new speech). Toggling dictation off right after speaking waits (bounded by `contextual.timeout_s`) for the last transform. **Privacy**: on the `openrouter`/`anthropic` profiles your transcript, selection, and clipboard are sent to that provider — the default profile is fully local.
 
 ## Configuration
 
@@ -64,8 +94,8 @@ Two long-lived processes:
   "device": "auto",
   "compute_type": "auto",
   "input_device": null,
-  "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_new_audio_s": 0.3, "max_buffer_s": 12.0 },
-  "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
+  "streaming": { "enabled": true, "infer_interval_s": 0.5, "min_infer_interval_s": 0.25, "min_new_audio_s": 0.3, "max_buffer_s": 8.0 },
+  "vad": { "backend": "auto", "onset": 0.5, "offset": 0.35, "onset_frames": 2, "min_silence_ms": 500, "speculative_silence_ms": 200, "pre_roll_ms": 320, "min_speech_s": 0.3, "max_utterance_s": 28.0 },
   "typing": { "mode": "correcting", "wtype_timeout_s": 10.0, "wtype_delay_ms": 6, "sentence_trailing_space": true, "capitalize_sentences": true, "electron_workaround": true },
   "audio": { "persistent_capture": true }
 }
@@ -93,7 +123,11 @@ Useful knobs:
   gate" so the real space lands. Default true; only ever applied to matching
   apps, so terminals/editors never receive ZWSP characters. Add your app's
   window class to `electron_app_classes` if another Electron app fuses words.
+- `contextual.*` — contextual dictation (see the section above): `profile` selects the LLM endpoint, `timeout_s` bounds each transform, `context_max_chars` caps selection/clipboard context, `notify` controls toasts.
 - `vad.min_silence_ms` — how long a pause ends an utterance.
+- `vad.speculative_silence_ms` — **speculative finalize**: after this much silence the final decode starts early, so when the pause reaches `min_silence_ms` the result is already computed — final text lands the instant the utterance ends. Resuming speech discards the speculation (some GPU time wasted, nothing else). 0 disables.
+- `streaming.min_infer_interval_s` — adaptive decode cadence floor: the live re-decode interval tracks 1.5× the measured decode time between this floor and `infer_interval_s`, so a fast GPU + short utterance self-corrects at up to 4 Hz.
+- Long contextual replacements (≥120 chars) in Electron apps are delivered via clipboard paste (Ctrl+V, previous clipboard restored) instead of keystrokes — a 200-char rewrite lands in one keystroke instead of ~1.2 s of typing.
 - `audio.persistent_capture` — keep the mic stream open across toggles (default true). Opening/closing a USB mic renegotiates isochronous bandwidth on its USB controller, which can audibly glitch *other* audio devices on the same controller; persistent capture negotiates once. While dictation is off, captured audio is discarded immediately and never transcribed. Set `false` to fully release the mic on toggle-off.
 - Invalid values fall back to defaults with a warning in the log; unknown keys are reported, never fatal.
 

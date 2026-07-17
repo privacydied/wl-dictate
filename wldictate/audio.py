@@ -189,6 +189,11 @@ class AudioCapture:
                     device=self._device,
                     channels=1,
                     dtype="float32",
+                    # Small fixed blocks: the session loop runs (VAD, decode
+                    # drain, render, transform poll) once per delivered block,
+                    # so block size bounds the whole pipeline's reaction time.
+                    # 512 @ 48kHz ≈ 10.7ms, @ 16kHz = 32ms.
+                    blocksize=512,
                     callback=self._callback,
                 )
                 stream.start()

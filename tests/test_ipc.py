@@ -53,3 +53,17 @@ def test_event_junk_returns_none():
 def test_event_non_string_fields_dropped():
     ev = ipc.parse_event('{"ev": "error", "msg": 42}')
     assert ev is not None and ev.msg is None
+
+
+def test_command_mode_round_trip():
+    line = ipc.format_command("start", 3, "Mic", mode="contextual")
+    cmd = ipc.parse_command(line)
+    assert cmd.mode == "contextual"
+    assert cmd.device == 3
+
+
+def test_command_mode_defaults_and_junk():
+    assert ipc.parse_command('{"cmd": "start"}').mode == "standard"
+    assert ipc.parse_command('{"cmd": "start", "mode": "chaos"}').mode == "standard"
+    # mode key omitted from the wire format when not set (old-worker compat)
+    assert '"mode"' not in ipc.format_command("start")

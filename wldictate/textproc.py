@@ -161,6 +161,15 @@ class TextFormatter:
         self._tail = (self._tail + text)[-8:]
         return text
 
+    def reseed(self, text: str) -> None:
+        """Make spacing state match ``text`` now ending the on-screen output.
+
+        Contextual mode replaces a finalized utterance on screen with LLM
+        output; the next utterance's separator/capitalization must be computed
+        against the *replacement*, not the original Whisper text.
+        """
+        self._tail = text[-8:] if text else ""
+
     def peek(self, raw: str) -> str:
         """Format ``raw`` exactly as :meth:`format_delta` would, WITHOUT
         mutating spacing state.

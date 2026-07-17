@@ -109,3 +109,72 @@ def test_corrupt_config_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr("wldictate.config._legacy_config_paths", lambda: [])
     cfg = Config.load()
     assert cfg.model == "small.en"
+
+
+# ── contextual dictation config ──────────────────────────────────────────────
+
+
+def test_contextual_defaults_round_trip():
+    cfg = Config()
+    d = json.loads(json.dumps(cfg.to_dict()))
+    assert d["contextual"]["profile"] == "local"
+    assert d["contextual"]["profiles"]["local"]["base_url"] == "http://127.0.0.1:8890/v1"
+    cfg2 = Config.from_dict(d)
+    assert cfg2.contextual.profile == "local"
+    assert cfg2.contextual.profiles["openrouter"].model.startswith("nvidia/")
+    assert cfg2.contextual.profiles["anthropic"].backend == "anthropic"
+    assert not cfg2.warnings
+
+
+def test_contextual_unknown_profile_falls_back():
+    cfg = Config.from_dict({"contextual": {"profile": "chaos"}})
+    assert cfg.contextual.profile == "local"
+    assert cfg.warnings
+
+
+def test_contextual_partial_profile_merge():
+    cfg = Config.from_dict(
+        {"contextual": {"profiles": {"local": {"model": "other-model"}}}}
+    )
+    assert cfg.contextual.profiles["local"].model == "other-model"
+    # Untouched fields keep their defaults; other profiles survive the merge.
+    assert cfg.contextual.profiles["local"].base_url == "http://127.0.0.1:8890/v1"
+    assert "openrouter" in cfg.contextual.profiles
+    assert not cfg.warnings
+
+
+def test_contextual_new_custom_profile():
+    cfg = Config.from_dict(
+        {
+            "contextual": {
+                "profile": "work",
+                "profiles": {
+                    "work": {
+                        "backend": "openai",
+                        "base_url": "https://llm.example/v1",
+                        "model": "m",
+                    }
+                },
+            }
+        }
+    )
+    assert cfg.contextual.profile == "work"
+    assert cfg.contextual.profiles["work"].base_url == "https://llm.example/v1"
+    assert not cfg.warnings
+
+
+def test_contextual_invalid_values_fall_back():
+    cfg = Config.from_dict(
+        {
+            "contextual": {
+                "timeout_s": 999,
+                "notify": "yes",
+                "profiles": {"local": {"backend": "grpc", "model": 7}},
+            }
+        }
+    )
+    assert cfg.contextual.timeout_s == 10.0
+    assert cfg.contextual.notify is True
+    assert cfg.contextual.profiles["local"].backend == "openai"
+    assert cfg.contextual.profiles["local"].model == "qwen3.5-9b"
+    assert cfg.warnings

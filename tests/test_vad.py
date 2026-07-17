@@ -105,3 +105,79 @@ def test_energy_vad_detects_speech():
     vad = EnergyVAD()
     assert vad.prob(SILENCE) == 0.0
     assert vad.prob(LOUD) == 1.0
+
+
+def _speech_frame():
+    return np.full(FRAME_SAMPLES, 0.5, dtype=np.float32)
+
+
+def _silence_frame():
+    return np.zeros(FRAME_SAMPLES, dtype=np.float32)
+
+
+class _ScriptVAD:
+    """prob() pops scripted probabilities."""
+
+    def __init__(self, probs):
+        self.probs = list(probs)
+
+    def prob(self, frame):
+        return self.probs.pop(0) if self.probs else 0.0
+
+    def reset(self):
+        pass
+
+
+def test_speculative_maybe_ended_then_ended():
+    # spec at ~2 frames (64ms), end at ~4 frames (128ms)
+    gate = VadGate(
+        _ScriptVAD([1, 1, 1, 0, 0, 0, 0]),
+        onset_frames=2,
+        min_silence_ms=128,
+        speculative_silence_ms=64,
+        pre_roll_ms=0,
+    )
+    events = []
+    for _ in range(7):
+        r = gate.process(_silence_frame())  # probs come from the script
+        events.append(
+            (r.utterance_started, r.utterance_maybe_ended, r.utterance_ended)
+        )
+    maybe_idx = [i for i, e in enumerate(events) if e[1]]
+    ended_idx = [i for i, e in enumerate(events) if e[2]]
+    assert len(maybe_idx) == 1 and len(ended_idx) == 1
+    assert maybe_idx[0] < ended_idx[0]  # speculation strictly precedes the end
+
+
+def test_speculation_cancelled_when_speech_resumes():
+    gate = VadGate(
+        _ScriptVAD([1, 1, 0, 0, 1, 1, 0, 0, 0, 0]),
+        onset_frames=2,
+        min_silence_ms=128,
+        speculative_silence_ms=64,
+        pre_roll_ms=0,
+    )
+    maybes = cancels = ends = 0
+    for _ in range(10):
+        r = gate.process(_silence_frame())
+        maybes += r.utterance_maybe_ended
+        cancels += r.speculation_cancelled
+        ends += r.utterance_ended
+    assert maybes == 2  # once per silence stretch
+    assert cancels == 1  # speech resumed after the first speculation
+    assert ends == 1
+
+
+def test_speculation_disabled_when_zero_or_too_large():
+    for spec_ms in (0, 128, 500):
+        gate = VadGate(
+            _ScriptVAD([1, 1, 0, 0, 0, 0]),
+            onset_frames=2,
+            min_silence_ms=128,
+            speculative_silence_ms=spec_ms,
+            pre_roll_ms=0,
+        )
+        maybes = 0
+        for _ in range(6):
+            maybes += gate.process(_silence_frame()).utterance_maybe_ended
+        assert maybes == 0, f"spec_ms={spec_ms} should disable speculation"

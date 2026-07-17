@@ -20,6 +20,7 @@ from .emitter import make_emitter
 from .streaming import StreamingSession
 from .textproc import TextFormatter
 from .transcriber import FasterWhisperTranscriber
+from .transform import Transformer, TransformCoordinator, TransformUnavailable
 from .vad import VadGate, make_vad
 
 _print_lock = threading.Lock()
@@ -94,9 +95,15 @@ def _run_session(
     device: int | None,
     device_name: str | None,
     stop_event: threading.Event,
+    mode: str = "standard",
+    transformer: "Transformer | None" = None,
 ) -> None:
+    # Contextual mode replaces utterances in place, which REQUIRES the
+    # correcting emitter — force it regardless of typing.mode.
+    contextual = mode == "contextual" and transformer is not None
+    typing_mode = "correcting" if contextual else cfg.typing.mode
     emitter = make_emitter(
-        cfg.typing.mode,
+        typing_mode,
         wtype_timeout_s=cfg.typing.wtype_timeout_s,
         wtype_delay_ms=cfg.typing.wtype_delay_ms,
         wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
@@ -118,20 +125,32 @@ def _run_session(
         min_silence_ms=cfg.vad.min_silence_ms,
         pre_roll_ms=cfg.vad.pre_roll_ms,
         max_utterance_s=cfg.vad.max_utterance_s,
+        speculative_silence_ms=cfg.vad.speculative_silence_ms,
     )
     session = StreamingSession(
         transcriber,
         formatter,
         emitter,
         infer_interval_s=cfg.streaming.infer_interval_s,
+        min_infer_interval_s=cfg.streaming.min_infer_interval_s,
         min_new_audio_s=cfg.streaming.min_new_audio_s,
         max_buffer_s=cfg.streaming.max_buffer_s,
         min_speech_s=cfg.vad.min_speech_s,
         streaming_enabled=cfg.streaming.enabled,
-        correcting=cfg.typing.mode == "correcting",
+        correcting=typing_mode == "correcting",
         on_commit=lambda text: _emit("commit", text=text),
         on_error=lambda msg: _emit("error", msg=msg),
     )
+    coordinator: TransformCoordinator | None = None
+    if contextual:
+        coordinator = TransformCoordinator(
+            transformer,
+            emitter,  # make_emitter("correcting", ...) → CorrectingEmitter
+            formatter,
+            timeout_s=cfg.contextual.timeout_s,
+            notify_enabled=cfg.contextual.notify,
+            on_error=lambda msg: _emit("error", msg=msg),
+        )
 
     try:
         capture = captures.acquire(device, device_name)
@@ -141,15 +160,34 @@ def _run_session(
             _emit("listening")
             last_drop_warn = 0.0
             while not stop_event.is_set():
-                for frame in capture.get_frames(timeout=0.1):
+                # 50ms cap: even with a silent queue the loop still drains
+                # completed decodes / transforms promptly.
+                for frame in capture.get_frames(timeout=0.05):
                     result = gate.process(frame)
                     if result.utterance_started:
+                        if coordinator is not None:
+                            # A late transform must never rewrite into the new
+                            # utterance's region: cancel BEFORE the baseline
+                            # reset in start_utterance().
+                            coordinator.cancel_pending()
                         session.start_utterance()
+                        if coordinator is not None:
+                            # Capture screen context + prewarm the LLM while
+                            # the user is speaking.
+                            coordinator.prefetch()
                     if result.speech_frames:
                         session.feed(result.speech_frames)
+                    if result.speculation_cancelled:
+                        session.cancel_speculation()
+                    if result.utterance_maybe_ended:
+                        session.speculate_final()
                     if result.utterance_ended:
-                        session.finalize()
+                        final = session.finalize()
+                        if coordinator is not None and final:
+                            coordinator.submit(final)
                 session.tick()
+                if coordinator is not None:
+                    coordinator.poll()
                 dropped = capture.take_dropped()
                 if dropped:
                     now = time.monotonic()
@@ -160,7 +198,13 @@ def _run_session(
             # are not lost.
             flush = gate.flush()
             if flush.utterance_ended:
-                session.finalize()
+                final = session.finalize()
+                if coordinator is not None and final:
+                    coordinator.submit(final)
+            if coordinator is not None:
+                # Toggle-off right after speaking is the common case: give the
+                # in-flight transform its full budget, then apply or give up.
+                coordinator.drain()
             captures.release()
         except Exception:
             captures.invalidate()
@@ -168,6 +212,8 @@ def _run_session(
     except Exception as e:
         _emit("error", msg=f"session failed: {e}")
     finally:
+        if coordinator is not None:
+            coordinator.shutdown()
         try:
             session.stop()
         except Exception:
@@ -262,6 +308,19 @@ def run() -> int:
             if _session_running():
                 _log("start ignored: session already active")
                 continue
+            transformer: Transformer | None = None
+            if command.mode == "contextual":
+                try:
+                    transformer = Transformer(cfg.contextual)
+                except TransformUnavailable as e:
+                    _emit("error", msg=f"contextual dictation unavailable: {e}")
+                    try:
+                        from .notify import notify
+
+                        notify(f"Contextual dictation unavailable: {e}")
+                    except Exception:
+                        pass
+                    continue  # standard mode is unaffected; session not started
             # Re-resolve by name at start time: indices drift.
             device = command.device
             if command.device_name:
@@ -277,7 +336,16 @@ def run() -> int:
             stop_event.clear()
             session_thread = threading.Thread(
                 target=_run_session,
-                args=(cfg, transcriber, captures, device, command.device_name, stop_event),
+                args=(
+                    cfg,
+                    transcriber,
+                    captures,
+                    device,
+                    command.device_name,
+                    stop_event,
+                    command.mode,
+                    transformer,
+                ),
                 daemon=True,
                 name="audio-session",
             )

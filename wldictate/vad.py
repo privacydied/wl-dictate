@@ -139,6 +139,12 @@ class GateResult:
     utterance_started: bool = False
     utterance_ended: bool = False
     forced: bool = False
+    # Speculative finalize: silence has lasted ``speculative_silence_ms`` —
+    # the utterance will *probably* end. The engine can start the final decode
+    # now so the result is ready when (if) the gate closes.
+    utterance_maybe_ended: bool = False
+    # Speech resumed after ``utterance_maybe_ended``: discard the speculation.
+    speculation_cancelled: bool = False
 
 
 class VadGate:
@@ -163,12 +169,22 @@ class VadGate:
         min_silence_ms: int = 500,
         pre_roll_ms: int = 320,
         max_utterance_s: float = 28.0,
+        speculative_silence_ms: int = 200,
     ) -> None:
         self._vad = vad
         self._onset = onset
         self._offset = offset
         self._onset_frames = max(1, onset_frames)
         self._silence_frames_needed = max(1, round(min_silence_ms / 1000 / FRAME_SECONDS))
+        # Speculative finalize point (0 disables). Clamped below the real
+        # silence threshold so "maybe ended" always precedes "ended".
+        if speculative_silence_ms and speculative_silence_ms < min_silence_ms:
+            self._spec_frames_needed = max(
+                1, round(speculative_silence_ms / 1000 / FRAME_SECONDS)
+            )
+        else:
+            self._spec_frames_needed = 0
+        self._spec_fired = False
         self._pre_roll_frames = max(0, round(pre_roll_ms / 1000 / FRAME_SECONDS))
         self._max_utterance_frames = max(1, round(max_utterance_s / FRAME_SECONDS))
 
@@ -184,6 +200,7 @@ class VadGate:
         self._onset_run = 0
         self._silence_run = 0
         self._utterance_frames = 0
+        self._spec_fired = False
         self._pre_roll.clear()
         if hasattr(self._vad, "reset"):
             self._vad.reset()
@@ -220,6 +237,18 @@ class VadGate:
             self._silence_run += 1
         else:
             self._silence_run = 0
+            if self._spec_fired:
+                # Speech resumed after the speculative point.
+                self._spec_fired = False
+                result.speculation_cancelled = True
+
+        if (
+            self._spec_frames_needed
+            and not self._spec_fired
+            and self._silence_run >= self._spec_frames_needed
+        ):
+            self._spec_fired = True
+            result.utterance_maybe_ended = True
 
         if self._silence_run >= self._silence_frames_needed:
             self._end_utterance(result, forced=False)
@@ -239,5 +268,6 @@ class VadGate:
         self._onset_run = 0
         self._silence_run = 0
         self._utterance_frames = 0
+        self._spec_fired = False
         result.utterance_ended = True
         result.forced = forced

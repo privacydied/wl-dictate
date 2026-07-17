@@ -409,3 +409,95 @@ def test_correcting_final_decode_failure_keeps_tentative_text():
     h.speak(1.0)
     h.session.finalize()
     assert h.text() == "one two"
+
+
+def test_correcting_finalize_returns_final_text():
+    script = [[W(" hello", 0, 0.3)], [W(" hello.", 0, 0.3)]]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(1.0)
+    final = h.session.finalize()
+    assert final == "hello. "  # text + trailer, exactly what's on screen
+    assert h.text() == "hello. "
+
+
+def test_commit_mode_finalize_returns_none():
+    h = Harness([[W(" hello", 0, 0.3)]])
+    h.session.start_utterance()
+    h.speak(1.0)
+    assert h.session.finalize() is None
+
+
+def test_correcting_finalize_returns_none_after_sync_failure():
+    h = CorrectingHarness([[W(" one", 0, 0.3)], [W(" one two", 0, 0.6)]])
+    h.session.start_utterance()
+    h.speak(1.0)
+    h.device.fail = True
+    h.speak(1.0)  # a decode syncs -> fails -> _render_ok False
+    assert h.session.finalize() is None  # screen state unknown: no transform
+
+
+# ── speculative finalize + adaptive cadence ──────────────────────────────────
+
+
+def test_speculative_finalize_reuses_decode():
+    script = [[W(" hello", 0, 0.3)], [W(" hello there.", 0, 0.6)]]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(1.0)  # one interim decode
+    h.session.speculate_final()
+    assert h.session._speculative is not None
+    h.session._speculative[0].result(timeout=5.0)  # let the decode land
+    calls_before = len(h.fake.calls)
+    final = h.session.finalize()
+    # finalize used the speculative decode: no new transcribe call.
+    assert len(h.fake.calls) == calls_before
+    assert h.fake.calls[-1]["final"] is True
+    assert final == "hello there. "
+
+
+def test_cancelled_speculation_falls_back_to_fresh_decode():
+    script = [[W(" one", 0, 0.3)]]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(1.0)
+    h.session.speculate_final()
+    spec_future = h.session._speculative[0]
+    h.session.cancel_speculation()  # speech resumed
+    spec_future.result(timeout=5.0)  # discarded decode finishes in background
+    calls_before = len(h.fake.calls)
+    h.session.finalize()
+    assert len(h.fake.calls) == calls_before + 1  # fresh final decode ran
+
+
+def test_tick_suppressed_while_speculating():
+    class Slow(FakeTranscriber):
+        def transcribe(self, audio, *, final=False, prompt=None):
+            time.sleep(0.05)
+            return super().transcribe(audio, final=final, prompt=prompt)
+
+    h = Harness([])
+    h.session._transcriber = Slow([[W(" x", 0, 0.2)]])
+    h.session.start_utterance()
+    h.speak(1.0)
+    h.settle()
+    h.session.speculate_final()
+    calls = len(h.session._transcriber.calls)
+    h.speak(1.0)  # interim ticks would normally fire here
+    assert len(h.session._transcriber.calls) == calls  # suppressed
+    h.session.finalize()
+
+
+def test_adaptive_interval_floors_at_min():
+    # FakeTranscriber decodes instantly -> effective interval hits the floor.
+    script = [[W(f" w{i}", 0, 0.2)] for i in range(20)]
+    fast = Harness(script, min_infer_interval_s=0.2)
+    fast.session.start_utterance()
+    fast.speak(2.0)
+    fast_calls = len(fast.fake.calls)
+    fixed = Harness(script)  # no floor: fixed 0.5s cadence
+    fixed.session.start_utterance()
+    fixed.speak(2.0)
+    assert fast_calls > len(fixed.fake.calls)  # tighter cadence, more decodes
+    fast.session.finalize()
+    fixed.session.finalize()
