@@ -199,13 +199,14 @@ def test_electron_gate_fires_per_emission(fake_vkbd, monkeypatch):
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
     assert e.rewrite(0, " one") == ZWSP + " one"
     assert e.rewrite(0, " two") == ZWSP + " two"
-    # Rewrites with backspaces open the gate themselves: no ZWSP.
-    assert e.rewrite(2, " three") == " three"
+    # Backspace-led rewrites need the gate too: BackSpace is an editing key
+    # and does NOT disarm Chromium's re-armed space drop ("Testingtesting").
+    assert e.rewrite(2, " three") == ZWSP + " three"
     typed = [c for c in fake_vkbd.calls if c[0] == "text"]
     assert typed == [
         ("text", ZWSP + " one"),
         ("text", ZWSP + " two"),
-        ("text", " three"),
+        ("text", ZWSP + " three"),
     ]
 
 

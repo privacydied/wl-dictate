@@ -278,8 +278,13 @@ class WtypeEmitter(Emitter):
             # (Empirically Chromium re-arms the leading-space drop per input
             # burst, not per connection — gating only the first key of the
             # persistent connection brought the glitch back: "YoWhat'the".)
-            # Pure appends only: backspaces themselves open the gate.
-            if backspaces == 0 and self._needs_electron_gate(text):
+            # Backspace-led rewrites need the gate too: BackSpace is an
+            # editing key, not a text-producing one, and does NOT disarm the
+            # re-armed drop — "Testing." -> "Testing testing" backspaces the
+            # "." then retypes " testing", and the space was eaten
+            # ("Testingtesting"). The extra ZWSP is invisible, tracked in the
+            # correcting emitter, and cleaned up by later diffs.
+            if self._needs_electron_gate(text):
                 text = self._ZWSP + text
             sent_before = vk.keys_sent
             try:
@@ -291,10 +296,11 @@ class WtypeEmitter(Emitter):
                 if vk.keys_sent != sent_before:
                     return None  # keys may have landed: screen state unknown
                 # Nothing was delivered — safe to retry via the subprocess.
-        # Electron gate only on pure appends: with backspaces > 0 the
-        # BackSpace keys themselves open Electron's fresh-connection gate, so
-        # the retyped leading space lands without ZWSP accumulation.
-        if backspaces == 0 and self._needs_electron_gate(text):
+        # Same gate on the subprocess path: BackSpace keys do not disarm
+        # Chromium's space drop (editing keys aren't text input), so a
+        # backspace-led rewrite whose retyped suffix starts with a space
+        # still needs the ZWSP.
+        if self._needs_electron_gate(text):
             text = self._ZWSP + text
         # Pass text on stdin via wtype's "-" placeholder rather than as an
         # argv word: text that begins with "-" (e.g. a spoken dash) would

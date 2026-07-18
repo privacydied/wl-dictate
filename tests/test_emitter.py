@@ -210,17 +210,20 @@ def test_rewrite_noop_never_shells_out(monkeypatch):
     assert cap.calls == []
 
 
-def test_rewrite_electron_gate_only_on_pure_append(monkeypatch):
+def test_rewrite_electron_gate_fires_with_and_without_backspaces(monkeypatch):
     cap = _Capture()
     monkeypatch.setattr(subprocess, "run", cap)
     e = WtypeEmitter(delay_ms=0)
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
     # Pure append with leading space: gated (same as emit today).
     assert e.rewrite(0, " x") == ZWSP + " x"
-    # With backspaces the keys open Electron's gate; no ZWSP accumulation.
-    assert e.rewrite(2, " y") == " y"
+    # Backspace-led rewrite: BackSpace does not disarm Chromium's space drop
+    # (editing keys aren't text input) — the retyped leading space needs the
+    # ZWSP gate too, or "Testing." -> "Testing testing" fuses into
+    # "Testingtesting".
+    assert e.rewrite(2, " y") == ZWSP + " y"
     _, kwargs = cap.calls[1]
-    assert kwargs["input"] == " y"
+    assert kwargs["input"] == ZWSP + " y"
 
 
 def test_rewrite_failure_returns_none(monkeypatch):
