@@ -38,8 +38,9 @@ _WL_DISPLAY = 1  # fixed singleton object id
 _KEY_STATE_RELEASED = 0
 _KEY_STATE_PRESSED = 1
 _KEYMAP_FORMAT_XKB_V1 = 1
-#: Real-modifier bitmask for Control in the fixed core order
+#: Real-modifier bitmasks in the fixed core order
 #: (Shift=1, Lock=2, Control=4, Mod1..Mod5).
+MOD_SHIFT = 1
 MOD_CONTROL = 4
 
 #: Real evdev scancodes (wire codes) for keysyms that exist on a physical US
@@ -48,10 +49,8 @@ MOD_CONTROL = 4
 #: it break on synthetic input at made-up scancodes: Discord's editor
 #: silently ignores a space whose scancode isn't KEY_SPACE, so EVERY
 #: synthetic space vanished (ZWSP gate or not, vkbd and wtype alike).
-#: Placing these keys at their physical scancodes makes synthetic input
-#: indistinguishable from a real keyboard. Keysyms with no physical key
-#: (shifted chars, exotic unicode) get allocator codes — they are delivered
-#: by keysym and land fine anywhere.
+#: Placing keys at their physical scancodes makes synthetic input
+#: indistinguishable from a real keyboard.
 _EVDEV_CODES: dict[str, int] = {"Escape": 1, "BackSpace": 14, "Tab": 15, "Return": 28}
 for _chars, _base in (
     ("1234567890-=", 2),  # KEY_1 .. KEY_EQUAL
@@ -64,12 +63,43 @@ for _chars, _base in (
 _EVDEV_CODES["0x00000020"] = 57  # KEY_SPACE
 del _chars, _base, _i, _ch
 
-#: Wire codes for keysyms without a physical key allocate upward from here —
-#: clear of the whole physical main block (incl. modifiers, whose DomCodes
-#: must never be squatted on).
-_ALLOC_BASE = 90
-#: Highest usable wire code: xkb keycode = wire + 8 must stay ≤ 255.
-_MAX_CODE = 247
+#: Shifted ASCII -> its unshifted US base key. These are typed as
+#: Shift + base scancode (exactly like a real keyboard: correct scancode,
+#: correct DOM code, correct shiftKey) via the two-level keymap below —
+#: NEVER via made-up scancodes. The first scancode fix allocated shifted
+#: chars sequentially from 90, which put capital 'I' on KEY_MUTE (113),
+#: 'J'/'K' on volume, and 'L' on KEY_POWER — dictating "I" muted the
+#: user's audio, because parts of the stack act on SCANCODES regardless of
+#: the uploaded keymap.
+_SHIFT_BASE: dict[str, str] = {}
+for _lo in "abcdefghijklmnopqrstuvwxyz":
+    _SHIFT_BASE[_lo.upper()] = _lo
+for _b, _s in zip("1234567890-=[];'`\\,./", "!@#$%^&*()_+{}:\"~|<>?"):
+    _SHIFT_BASE[_s] = _b
+del _lo, _b, _s
+_SHIFT_OF = {b: s for s, b in _SHIFT_BASE.items()}
+
+#: The static keymap block: every physical key, two-level where a shifted
+#: partner exists ([a, A], [1, exclam]).  (sym, wire code, shifted sym|None)
+_STATIC_KEYS: list[tuple[str, int, str | None]] = []
+for _sym, _code in sorted(_EVDEV_CODES.items(), key=lambda kv: kv[1]):
+    _shifted = None
+    try:
+        _cp = int(_sym, 16)
+    except ValueError:
+        _cp = -1
+    if 0x20 <= _cp <= 0x7E and chr(_cp) in _SHIFT_OF:
+        _shifted = f"0x{ord(_SHIFT_OF[chr(_cp)]):08x}"
+    _STATIC_KEYS.append((_sym, _code, _shifted))
+del _sym, _code, _shifted, _cp
+
+#: Wire codes for exotic keysyms (unicode with no physical key: é, emoji,
+#: CJK from transforms). ONLY scancodes that are undefined in
+#: linux/input-event-codes.h (84, 195-199) plus the inert KEY_F13..F24
+#: block — any *real* key's scancode risks scancode-matching consumers
+#: (compositor media binds, logind's power-key handling). LRU-evicted when
+#: full; each new sym re-uploads the keymap.
+_DYN_CODES: tuple[int, ...] = (84, 195, 196, 197, 198, 199) + tuple(range(183, 195))
 
 
 class VkbdUnavailable(RuntimeError):
@@ -131,9 +161,10 @@ class WaylandVirtualKeyboard:
         self._callbacks: set[int] = set()  # ids of in-flight wl_callbacks
         self._done_callbacks: set[int] = set()
         self._globals: dict[str, tuple[int, int]] = {}  # iface -> (name, version)
-        #: keysym spec -> wire code (evdev scancode; xkb keycode = code + 8)
+        #: EXOTIC keysym spec -> wire code from _DYN_CODES, insertion-ordered
+        #: for LRU eviction. Physical keys live in the static _EVDEV_CODES /
+        #: _STATIC_KEYS tables and never appear here.
         self._sym_code: dict[str, int] = {}
-        self._alloc_next = _ALLOC_BASE
         #: total key events delivered on this connection (the Electron
         #: fresh-connection gate is open once this is > 0).
         self.keys_sent = 0
@@ -161,11 +192,9 @@ class WaylandVirtualKeyboard:
             manager = self._bind("zwp_virtual_keyboard_manager_v1", 1)
             self._vk = self._new_id()
             self._request(manager, 0, struct.pack("<II", self._seat, self._vk))
-            # Pre-seed printable ASCII so ordinary dictation never needs a
-            # keymap re-upload mid-utterance.
-            seed = [self._sym_for_char(chr(c)) for c in range(0x20, 0x7F)]
-            seed += ["Return", "Tab", "BackSpace", "Escape"]
-            self._add_syms(seed)
+            # The static block covers ALL of printable ASCII (unshifted keys
+            # + shift levels), so ordinary dictation never re-uploads the
+            # keymap mid-utterance; only exotic unicode does.
             self._upload_keymap()
             self._roundtrip()  # surface protocol errors before first use
         except Exception:
@@ -307,47 +336,35 @@ class WaylandVirtualKeyboard:
         keysym = cp if 0x20 <= cp <= 0x7E else 0x01000000 | cp
         return f"0x{keysym:08x}"
 
-    def _next_free(self) -> int | None:
-        """Next unused allocator wire code, or None when full."""
-        code = self._alloc_next
+    def _exotic_code(self, sym: str) -> int:
+        """Wire code for an exotic keysym, allocating (and re-uploading the
+        keymap) on first use. LRU: reuse refreshes recency; when all
+        ``_DYN_CODES`` slots are taken the least-recently-used sym is
+        evicted. Physical keys never pass through here."""
+        code = self._sym_code.get(sym)
+        if code is not None:
+            self._sym_code[sym] = self._sym_code.pop(sym)  # refresh recency
+            return code
         used = set(self._sym_code.values())
-        while code <= _MAX_CODE and code in used:
-            code += 1
-        if code > _MAX_CODE:
-            return None
-        self._alloc_next = code + 1
-        return code
-
-    def _add_syms(self, syms: list[str]) -> bool:
-        added = False
-        for sym in syms:
-            if sym in self._sym_code:
-                continue
-            code = _EVDEV_CODES.get(sym)
-            if code is None:
-                code = self._next_free()
-                if code is None:
-                    # Allocator full: rebuild with only the syms needed now
-                    # (physical keys keep their real scancodes by definition).
-                    self._sym_code = {}
-                    self._alloc_next = _ALLOC_BASE
-                    for s in dict.fromkeys(syms):
-                        c = _EVDEV_CODES.get(s)
-                        self._sym_code[s] = c if c is not None else self._next_free()
-                    return True
-            self._sym_code[sym] = code
-            added = True
-        return added
+        free = next((c for c in _DYN_CODES if c not in used), None)
+        if free is None:
+            oldest = next(iter(self._sym_code))
+            free = self._sym_code.pop(oldest)
+        self._sym_code[sym] = free
+        self._upload_keymap()
+        return free
 
     def keymap_text(self) -> str:
-        items = sorted(self._sym_code.items(), key=lambda kv: kv[1])
+        dyn = sorted(self._sym_code.items(), key=lambda kv: kv[1])
         lines = [
             "xkb_keymap {",
             'xkb_keycodes "(unnamed)" {',
             "minimum = 8;",
             "maximum = 255;",
         ]
-        for _sym, code in items:
+        for _sym, code, _sh in _STATIC_KEYS:
+            lines.append(f"<K{code}> = {code + 8};")
+        for _sym, code in dyn:
             lines.append(f"<K{code}> = {code + 8};")
         lines += [
             "};",
@@ -355,7 +372,12 @@ class WaylandVirtualKeyboard:
             'xkb_compatibility "(unnamed)" { include "complete" };',
             'xkb_symbols "(unnamed)" {',
         ]
-        for sym, code in items:
+        for sym, code, shifted in _STATIC_KEYS:
+            if shifted:
+                lines.append(f"key <K{code}> {{[{sym}, {shifted}]}};")
+            else:
+                lines.append(f"key <K{code}> {{[{sym}]}};")
+        for sym, code in dyn:
             lines.append(f"key <K{code}> {{[{sym}]}};")
         lines += ["};", "};", ""]
         return "\n".join(lines)
@@ -372,10 +394,6 @@ class WaylandVirtualKeyboard:
         finally:
             os.close(fd)
 
-    def _ensure(self, syms: list[str]) -> None:
-        if self._add_syms(syms):
-            self._upload_keymap()
-
     # ── Typing ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -385,20 +403,39 @@ class WaylandVirtualKeyboard:
     def _key_event(self, code: int, state: int) -> None:
         self._request(self._vk, 1, struct.pack("<III", self._now_ms(), code, state))
 
-    def _tap(self, code: int, delay_ms: int) -> None:
+    def _tap(self, code: int, delay_ms: int, *, mods: int = 0) -> None:
+        if mods:
+            self._request(self._vk, 2, struct.pack("<IIII", mods, 0, 0, 0))
         self._key_event(code, _KEY_STATE_PRESSED)
         self._key_event(code, _KEY_STATE_RELEASED)
+        if mods:
+            self._request(self._vk, 2, struct.pack("<IIII", 0, 0, 0, 0))
         self.keys_sent += 1
         if delay_ms > 0:
             self._flush()
             time.sleep(delay_ms / 1000.0)
 
+    def _char_plan(self, ch: str) -> tuple[int, int]:
+        """(wire code, modifier mask) delivering one character.
+
+        Shifted ASCII is Shift + its real base key (like a physical
+        keyboard); unshifted ASCII and named whitespace hit their own real
+        scancodes; exotic unicode uses an LRU slot from ``_DYN_CODES``.
+        """
+        base = _SHIFT_BASE.get(ch)
+        if base is not None:
+            return _EVDEV_CODES[self._sym_for_char(base)], MOD_SHIFT
+        sym = self._sym_for_char(ch)
+        code = _EVDEV_CODES.get(sym)
+        if code is not None:
+            return code, 0
+        return self._exotic_code(sym), 0
+
     def type_backspaces(self, count: int, delay_ms: int = 0) -> None:
         if count <= 0:
             return
         with self._lock:
-            self._ensure(["BackSpace"])
-            code = self._sym_code["BackSpace"]
+            code = _EVDEV_CODES["BackSpace"]
             for _ in range(count):
                 self._tap(code, delay_ms)
             self._flush()
@@ -408,32 +445,28 @@ class WaylandVirtualKeyboard:
         if not text:
             return
         with self._lock:
-            syms = [self._sym_for_char(ch) for ch in text]
-            self._ensure(syms)
-            for sym in syms:
-                self._tap(self._sym_code[sym], delay_ms)
+            for ch in text:
+                code, mods = self._char_plan(ch)
+                self._tap(code, delay_ms, mods=mods)
             self._flush()
             self.drain()
 
     def press_named(self, keysym: str, delay_ms: int = 0) -> None:
         """Tap one named xkb keysym (e.g. "Return", "Tab", "Escape")."""
         with self._lock:
-            self._ensure([keysym])
-            self._tap(self._sym_code[keysym], delay_ms)
+            code = _EVDEV_CODES.get(keysym)
+            if code is None:
+                code = self._exotic_code(keysym)
+            self._tap(code, delay_ms)
             self._flush()
             self.drain()
 
     def ctrl_tap(self, ch: str) -> None:
-        """Tap Control+<ch> (e.g. the paste chord Ctrl+V)."""
+        """Tap Control+<ch> (e.g. the paste chord Ctrl+V) at its real
+        scancode, so apps that match the chord by DOM code accept it."""
         with self._lock:
-            sym = self._sym_for_char(ch)
-            self._ensure([sym])
-            code = self._sym_code[sym]
-            self._request(self._vk, 2, struct.pack("<IIII", MOD_CONTROL, 0, 0, 0))
-            self._key_event(code, _KEY_STATE_PRESSED)
-            self._key_event(code, _KEY_STATE_RELEASED)
-            self._request(self._vk, 2, struct.pack("<IIII", 0, 0, 0, 0))
-            self.keys_sent += 1
+            code, _ = self._char_plan(ch)
+            self._tap(code, 0, mods=MOD_CONTROL)
             self._flush()
             self.drain()
 

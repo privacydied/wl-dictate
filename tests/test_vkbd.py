@@ -28,7 +28,12 @@ def bare_vkbd():
     """A WaylandVirtualKeyboard with no socket: exercises keymap logic only."""
     vk = WaylandVirtualKeyboard.__new__(WaylandVirtualKeyboard)
     vk._sym_code = {}
-    vk._alloc_next = vkbd_mod._ALLOC_BASE
+    vk.uploads = 0
+
+    def fake_upload():
+        vk.uploads += 1
+
+    vk._upload_keymap = fake_upload
     return vk
 
 
@@ -42,45 +47,49 @@ def test_sym_for_char_uses_hex_keysyms_and_named_keys():
     assert WaylandVirtualKeyboard._sym_for_char("\t") == "Tab"
 
 
-def test_keymap_text_uses_real_scancodes():
-    vk = bare_vkbd()
-    vk._add_syms(["0x00000041", "Return"])  # 'A' (shifted: allocator), Return
-    text = vk.keymap_text()
+def test_static_keymap_uses_real_scancodes_with_shift_levels():
+    text = bare_vkbd().keymap_text()
     assert "minimum = 8;" in text
     assert "maximum = 255;" in text
-    # Return sits at its REAL evdev scancode (KEY_ENTER=28 -> xkb 36):
+    # Physical keys at their REAL evdev scancodes (xkb = evdev + 8):
     # Chromium derives event.code from the scancode, not the keymap.
-    assert "<K28> = 36;" in text
-    assert "key <K28> {[Return]};" in text
-    # 'A' has no unshifted physical key: allocator range, clear of the
-    # physical main block.
-    assert f"<K{vkbd_mod._ALLOC_BASE}> = {vkbd_mod._ALLOC_BASE + 8};" in text
-    assert f"key <K{vkbd_mod._ALLOC_BASE}> {{[0x00000041]}};" in text
+    assert "<K57> = 65;" in text  # KEY_SPACE — the Discord space fix
+    assert "key <K57> {[0x00000020]};" in text
+    assert "key <K28> {[Return]};" in text  # KEY_ENTER
+    assert "key <K14> {[BackSpace]};" in text  # KEY_BACKSPACE
+    # Two-level keys: shifted chars ride their base key like a real keyboard
+    # ('a'/'A' on KEY_A=30, '1'/'!' on KEY_1=2) — NEVER made-up scancodes,
+    # which landed on media keys (capital 'I' -> KEY_MUTE muted the audio).
+    assert "key <K30> {[0x00000061, 0x00000041]};" in text
+    assert "key <K2> {[0x00000031, 0x00000021]};" in text
     assert 'xkb_types "(unnamed)" { include "complete" };' in text
     assert 'xkb_compatibility "(unnamed)" { include "complete" };' in text
 
 
-def test_physical_keys_get_real_evdev_codes():
+def test_char_plan_shift_combos_and_real_codes():
     vk = bare_vkbd()
-    vk._add_syms(["0x00000020", "0x00000061", "BackSpace", "0x00000041"])
-    assert vk._sym_code["0x00000020"] == 57  # KEY_SPACE — the Discord fix
-    assert vk._sym_code["0x00000061"] == 30  # 'a' at KEY_A
-    assert vk._sym_code["BackSpace"] == 14  # KEY_BACKSPACE
-    assert vk._sym_code["0x00000041"] == vkbd_mod._ALLOC_BASE  # 'A': allocator
-    assert vk._add_syms(["0x00000061"]) is False  # already mapped
+    assert vk._char_plan("a") == (30, 0)  # KEY_A
+    assert vk._char_plan("A") == (30, vkbd_mod.MOD_SHIFT)  # Shift+KEY_A
+    assert vk._char_plan(" ") == (57, 0)  # KEY_SPACE
+    assert vk._char_plan("I") == (23, vkbd_mod.MOD_SHIFT)  # Shift+KEY_I, NOT KEY_MUTE
+    assert vk._char_plan("!") == (2, vkbd_mod.MOD_SHIFT)  # Shift+KEY_1
+    assert vk._char_plan("\n") == (28, 0)  # Return
+    assert vk.uploads == 0  # ASCII never re-uploads the keymap
 
 
-def test_add_syms_evicts_on_overflow(monkeypatch):
-    monkeypatch.setattr(vkbd_mod, "_MAX_CODE", vkbd_mod._ALLOC_BASE + 1)
+def test_exotic_chars_use_safe_slots_with_lru_eviction():
     vk = bare_vkbd()
-    vk._add_syms(["s1", "s2"])  # exotic syms: fill both allocator codes
-    assert vk._add_syms(["s2", "s3"]) is True  # overflow: rebuild
-    assert set(vk._sym_code) == {"s2", "s3"}
-    # Physical keys always keep their real codes through a rebuild.
-    vk2 = bare_vkbd()
-    vk2._add_syms(["s1", "s2"])
-    assert vk2._add_syms(["0x00000020", "s3"]) is True
-    assert vk2._sym_code["0x00000020"] == 57
+    code, mods = vk._char_plan("é")
+    assert mods == 0
+    assert code in vkbd_mod._DYN_CODES
+    assert vk.uploads == 1
+    assert vk._char_plan("é") == (code, 0)  # cached: no re-upload
+    assert vk.uploads == 1
+    # Fill every slot, then one more: the LRU sym is evicted, code reused.
+    for i in range(len(vkbd_mod._DYN_CODES) - 1):
+        vk._char_plan(chr(0x4E00 + i))
+    assert vk._char_plan("œ")[0] == code  # 'é' was oldest -> evicted
+    assert "0x010000e9" not in vk._sym_code
 
 
 def test_registry_global_event_parsing():
