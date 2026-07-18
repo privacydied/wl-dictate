@@ -18,3 +18,4 @@ nuitka-crash-report.xml
 # The bundled binary itself (both build scripts emit dist/wl-dictate):
 /wl-dictate
 .nfs*
+bin/
