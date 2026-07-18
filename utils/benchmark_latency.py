@@ -80,27 +80,31 @@ def bench_decode() -> dict:
     import numpy as np
 
     from wldictate.config import Config
+    from wldictate.hardware import resolve_whisper_model
     from wldictate.transcriber import FasterWhisperTranscriber
 
     cfg = Config.load()
-    tr = FasterWhisperTranscriber(cfg.model, cfg.device, cfg.compute_type)
+    model, _ = resolve_whisper_model(cfg.model)  # "auto" -> concrete model
+    tr = FasterWhisperTranscriber(model, cfg.device, cfg.compute_type)
     tr.load()
     warmup_s = tr.warmup()
     rng = np.random.default_rng(0)
     out = {
-        "model": cfg.model,
+        "model": model,
         "device": tr.device,
         "compute_type": tr.compute_type,
         "warmup_s": round(warmup_s, 4),
     }
     for seconds in (3, 6, 12):
         audio = (rng.standard_normal(16000 * seconds) * 0.01).astype(np.float32)
-        times = []
-        for _ in range(5):
-            t0 = time.perf_counter()
-            tr.transcribe(audio, final=False)
-            times.append(time.perf_counter() - t0)
-        out[f"decode_{seconds}s_median_s"] = round(sorted(times)[len(times) // 2], 4)
+        for final in (False, True):
+            times = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                tr.transcribe(audio, final=final)
+                times.append(time.perf_counter() - t0)
+            key = f"decode_{'final_' if final else ''}{seconds}s_median_s"
+            out[key] = round(sorted(times)[len(times) // 2], 4)
     return out
 
 

@@ -501,3 +501,51 @@ def test_adaptive_interval_floors_at_min():
     assert fast_calls > len(fixed.fake.calls)  # tighter cadence, more decodes
     fast.session.finalize()
     fixed.session.finalize()
+
+
+# ── Tentative-tail confidence gating ─────────────────────────────────────────
+
+
+def test_low_confidence_tail_held_until_confirmed():
+    script = [
+        [W(" the", 0, 0.2), W(" quix", 0.2, 0.5, prob=0.1)],
+        [W(" the", 0, 0.2), W(" quix", 0.2, 0.5, prob=0.1)],  # survives a decode
+    ]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(2.0)
+    # First render held the unconfirmed low-confidence word back...
+    assert h.device.ops[0] == (0, "the")
+    # ...then rendered it once a second decode agreed.
+    assert h.text().endswith("quix")
+    h.session.finalize()
+    assert h.text() == "the quix"
+
+
+def test_final_decode_renders_low_confidence_words():
+    script = [[W(" um", 0, 0.3, prob=0.05)]]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(1.0)
+    assert h.text() == ""  # gated during the live render
+    h.session.finalize()
+    assert h.text() == "um"  # the final decode always renders everything
+
+
+def test_confidence_gate_disabled_renders_everything():
+    script = [[W(" um", 0, 0.3, prob=0.05)]]
+    h = CorrectingHarness(script, tail_confidence_min=0.0)
+    h.session.start_utterance()
+    h.speak(1.0)
+    assert h.text() == "um"
+
+
+def test_confidence_gate_only_trims_the_tail():
+    # A low-prob word FOLLOWED by a high-prob word is not hidden (only a
+    # contiguous unconfirmed tail may be trimmed).
+    script = [[W(" foo", 0, 0.2, prob=0.1), W(" bar", 0.2, 0.4, prob=0.9)]]
+    h = CorrectingHarness(script)
+    h.session.start_utterance()
+    h.speak(1.0)
+    assert h.text() == "foo bar"
+    h.session.finalize()

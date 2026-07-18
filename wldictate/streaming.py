@@ -71,6 +71,7 @@ class StreamingSession:
         min_speech_s: float = 0.3,
         streaming_enabled: bool = True,
         correcting: bool = False,
+        tail_confidence_min: float = 0.3,
         on_commit: Callable[[str], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -89,6 +90,12 @@ class StreamingSession:
         self._min_speech = int(min_speech_s * SAMPLE_RATE)
         self._streaming_enabled = streaming_enabled
         self._correcting = correcting
+        # Live-render confidence gate: trailing words below this probability
+        # are held back until they survive a second decode. The words that
+        # visibly flicker are exactly the low-probability ones; holding them
+        # one decode round costs no real latency (they would have been
+        # corrected anyway) and keeps wrong words off the screen. 0 disables.
+        self._tail_confidence_min = tail_confidence_min
         self._on_commit = on_commit
         self._on_error = on_error
         self._clock = clock
@@ -332,8 +339,21 @@ class StreamingSession:
             self._committed = list(words[:agree])
         self._prev_norm = norm_new
         if self._correcting:
-            self._render(words)
+            self._render(self._gate_tail(words, agree))
         self._maybe_trim()
+
+    def _gate_tail(self, words: list[Word], agree: int) -> list[Word]:
+        """Trim trailing low-confidence words that no second decode has
+        confirmed yet (index >= the agreed prefix). Only a contiguous tail
+        is trimmed — words can't be hidden mid-hypothesis. The final decode
+        renders everything, so nothing is ever lost."""
+        if self._tail_confidence_min <= 0.0:
+            return words
+        stable = max(agree, len(self._committed))
+        end = len(words)
+        while end > stable and words[end - 1].prob < self._tail_confidence_min:
+            end -= 1
+        return words if end == len(words) else words[:end]
 
     def _render(self, words: list[Word]) -> None:
         """Correcting mode: sync the screen to the full current hypothesis."""

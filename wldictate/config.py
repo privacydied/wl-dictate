@@ -79,6 +79,11 @@ class StreamingConfig:
     # Committed audio is trimmed out of the buffer beyond this: smaller
     # windows decode faster (every tick re-decodes the whole window).
     max_buffer_s: float = 8.0
+    # Correcting mode: trailing hypothesis words with probability below this
+    # are held off the screen until a second decode confirms them — the
+    # words that visibly flicker are exactly the low-confidence ones, and
+    # holding them one round costs no real latency. 0 disables.
+    tail_confidence_min: float = 0.3
 
 
 @dataclass
@@ -518,6 +523,11 @@ class Config:
         if not (2.0 <= s.max_buffer_s <= 30.0):
             self.warnings.append("streaming.max_buffer_s out of range [2, 30]; using 8")
             s.max_buffer_s = 8.0
+        if not (0.0 <= s.tail_confidence_min <= 1.0):
+            self.warnings.append(
+                "streaming.tail_confidence_min out of range [0, 1]; using 0.3"
+            )
+            s.tail_confidence_min = 0.3
         if self.vad.speculative_silence_ms < 0:
             self.warnings.append("vad.speculative_silence_ms negative; using 200")
             self.vad.speculative_silence_ms = 200

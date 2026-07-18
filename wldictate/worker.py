@@ -228,6 +228,7 @@ def _run_session(
         min_speech_s=cfg.vad.min_speech_s,
         streaming_enabled=cfg.streaming.enabled,
         correcting=typing_mode == "correcting",
+        tail_confidence_min=cfg.streaming.tail_confidence_min,
         on_commit=lambda text: _emit("commit", text=text),
         on_error=lambda msg: _emit("error", msg=msg),
     )

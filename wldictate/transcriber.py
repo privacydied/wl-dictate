@@ -60,6 +60,7 @@ class FasterWhisperTranscriber(Transcriber):
         self._model = None
         self.device = "unloaded"
         self.compute_type = "unloaded"
+        self._final_beam = 2  # widened on GPU in load()
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -105,6 +106,13 @@ class FasterWhisperTranscriber(Transcriber):
             )
         self.device = device
         self.compute_type = compute
+        # Final-decode beam width, by hardware. The final decode is what
+        # lands on screen and usually runs speculatively inside the
+        # end-of-utterance silence, so on a GPU a wide beam buys accuracy
+        # with mostly-hidden latency. On CPU the wide beam is NOT hidden
+        # (measured ~3x slower on short windows), so keep the old width.
+        # Measure with utils/benchmark_latency.py (decode_final_*).
+        self._final_beam = 5 if device == "cuda" else 2
 
     def warmup(self) -> float:
         """One throwaway decode so the first real utterance is not slow.
@@ -131,7 +139,9 @@ class FasterWhisperTranscriber(Transcriber):
         segments, _ = self._model.transcribe(
             audio,
             language="en",
-            beam_size=2 if final else 1,
+            # Interim decodes stay greedy (re-run constantly, latency-bound);
+            # the final decode uses the hardware-dependent beam set in load().
+            beam_size=self._final_beam if final else 1,
             word_timestamps=True,
             condition_on_previous_text=False,
             initial_prompt=prompt or None,
