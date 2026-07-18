@@ -138,7 +138,15 @@ def focused_window(env: dict[str, str]) -> tuple[str, str]:
 
 
 class WtypeEmitter(Emitter):
-    """Types text into the focused window with wtype."""
+    """Types text into the focused window.
+
+    Preferred device is a persistent in-process virtual keyboard (see
+    ``wldictate.vkbd``): one Wayland connection for the worker lifetime, no
+    per-rewrite process spawn, and no fresh-connection Electron space drop.
+    The wtype subprocess remains as the always-available fallback (and the
+    default for bare construction, so tests and non-worker callers never
+    touch the live compositor).
+    """
 
     #: Invisible gate-opener for Electron's leading-space drop (see rewrite()).
     _ZWSP = ZWSP
@@ -161,6 +169,7 @@ class WtypeEmitter(Emitter):
             "element",
             "signal",
         ),
+        backend: str = "wtype",  # wtype | vkbd | auto (vkbd w/ fallback)
     ) -> None:
         self._timeout = timeout_s
         # Per-keystroke delay (`wtype -d`), paces bursts for slow consumers.
@@ -169,8 +178,26 @@ class WtypeEmitter(Emitter):
         self._press_delay_ms = max(0, int(press_delay_ms))
         self._electron_workaround = electron_workaround
         self._electron_classes = tuple(c.lower() for c in electron_classes)
+        self._backend = backend
         self._env = os.environ.copy()
         _guess_wayland_env(self._env)
+
+    def _vkbd(self):
+        """The shared persistent virtual keyboard, or None (unavailable /
+        backend disabled). Availability is cached process-wide."""
+        if self._backend not in ("auto", "vkbd"):
+            return None
+        from . import vkbd  # lazy: never imported on the pure-wtype path
+
+        return vkbd.get_virtual_keyboard(self._env)
+
+    def _vkbd_failed(self, e: Exception) -> None:
+        """Runtime failure on the persistent connection: drop it so the next
+        call reconnects (compositor restart) or falls back for good."""
+        print(f"virtual keyboard error: {e}", file=sys.stderr)
+        from . import vkbd
+
+        vkbd.invalidate(self._env)
 
     def _focused_window_class(self) -> str:
         """Window class of the focused window ("" if unknown / not Hyprland)."""
@@ -211,6 +238,26 @@ class WtypeEmitter(Emitter):
         backspaces = max(0, backspaces)
         if backspaces == 0 and not text:
             return ""
+        vk = self._vkbd()
+        if vk is not None:
+            # The Electron gate is per *connection*; ours is persistent, so
+            # only the very first key of the whole connection can be eaten.
+            if (
+                backspaces == 0
+                and vk.keys_sent == 0
+                and self._needs_electron_gate(text)
+            ):
+                text = self._ZWSP + text
+            sent_before = vk.keys_sent
+            try:
+                vk.type_backspaces(backspaces, self._delay_ms)
+                vk.type_text(text, self._delay_ms)
+                return text
+            except Exception as e:
+                self._vkbd_failed(e)
+                if vk.keys_sent != sent_before:
+                    return None  # keys may have landed: screen state unknown
+                # Nothing was delivered — safe to retry via the subprocess.
         # Electron gate only on pure appends: with backspaces > 0 the
         # BackSpace keys themselves open Electron's fresh-connection gate, so
         # the retyped leading space lands without ZWSP accumulation.
@@ -271,22 +318,35 @@ class WtypeEmitter(Emitter):
         previous = self._read_clipboard()
         if not self._write_clipboard(text):
             return self.rewrite(backspaces, text)
-        cmd = ["wtype"]
-        if self._press_delay_ms > 0:
-            cmd += ["-s", str(self._press_delay_ms)]
-        for _ in range(max(0, backspaces)):
-            if self._delay_ms > 0:
-                cmd += ["-s", str(self._delay_ms)]
-            cmd += ["-k", "BackSpace"]
-        cmd += ["-s", str(max(10, self._delay_ms)), "-M", "ctrl", "-k", "v", "-m", "ctrl"]
-        try:
-            result = subprocess.run(
-                cmd, env=self._env, timeout=self._timeout, capture_output=True, text=True
-            )
-            ok = result.returncode == 0
-        except Exception as e:
-            print(f"wtype paste failed: {e}", file=sys.stderr)
-            ok = False
+        ok = False
+        partial = False  # some keys delivered on a failed vkbd attempt
+        vk = self._vkbd()
+        if vk is not None:
+            sent_before = vk.keys_sent
+            try:
+                vk.type_backspaces(max(0, backspaces), self._delay_ms)
+                vk.ctrl_tap("v")
+                ok = True
+            except Exception as e:
+                self._vkbd_failed(e)
+                partial = vk.keys_sent != sent_before
+        if not ok and not partial:
+            cmd = ["wtype"]
+            if self._press_delay_ms > 0:
+                cmd += ["-s", str(self._press_delay_ms)]
+            for _ in range(max(0, backspaces)):
+                if self._delay_ms > 0:
+                    cmd += ["-s", str(self._delay_ms)]
+                cmd += ["-k", "BackSpace"]
+            cmd += ["-s", str(max(10, self._delay_ms)), "-M", "ctrl", "-k", "v", "-m", "ctrl"]
+            try:
+                result = subprocess.run(
+                    cmd, env=self._env, timeout=self._timeout, capture_output=True, text=True
+                )
+                ok = result.returncode == 0
+            except Exception as e:
+                print(f"wtype paste failed: {e}", file=sys.stderr)
+                ok = False
         if previous is not None:
             timer = threading.Timer(
                 _CLIPBOARD_RESTORE_DELAY_S, self._write_clipboard, args=(previous,)
@@ -298,6 +358,16 @@ class WtypeEmitter(Emitter):
         return text
 
     def press_key(self, keysym: str) -> bool:
+        vk = self._vkbd()
+        if vk is not None:
+            sent_before = vk.keys_sent
+            try:
+                vk.press_named(keysym)
+                return True
+            except Exception as e:
+                self._vkbd_failed(e)
+                if vk.keys_sent != sent_before:
+                    return False  # may have landed: don't risk a double press
         cmd = ["wtype"]
         if self._press_delay_ms > 0:
             cmd += ["-s", str(self._press_delay_ms)]
@@ -489,6 +559,7 @@ def make_emitter(
     wtype_press_delay_ms: int = 0,
     electron_workaround: bool = True,
     electron_classes: tuple[str, ...] | list[str] | None = None,
+    backend: str = "wtype",
 ) -> Emitter:
     """Factory honoring the WL_DICTATE_EMIT env override (wtype|stdout|null).
 
@@ -510,6 +581,7 @@ def make_emitter(
             delay_ms=wtype_delay_ms,
             press_delay_ms=wtype_press_delay_ms,
             electron_workaround=electron_workaround,
+            backend=backend,
         )
         if electron_classes is not None:
             kwargs["electron_classes"] = electron_classes

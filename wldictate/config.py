@@ -105,6 +105,12 @@ class VadConfig:
 @dataclass
 class TypingConfig:
     mode: str = "correcting"  # correcting (live rewrite) | commit (append-only)
+    # Keystroke device: "auto" prefers a persistent in-process virtual
+    # keyboard (one Wayland connection for the worker lifetime — no
+    # per-rewrite process spawn, no fresh-connection Electron space drop)
+    # and falls back to the wtype subprocess when unavailable. "wtype"
+    # forces the subprocess path; "vkbd" forces the persistent device.
+    backend: str = "auto"  # auto | vkbd | wtype
     wtype_timeout_s: float = 10.0
     # Per-keystroke delay (ms) passed to `wtype -d`. Electron/Chromium apps
     # (Vesktop, Discord, VSCode, Slack) drop characters — usually spaces and
@@ -492,6 +498,11 @@ class Config:
                 f"unsupported typing.mode '{self.typing.mode}'; using 'correcting'"
             )
             self.typing.mode = "correcting"
+        if self.typing.backend not in ("auto", "vkbd", "wtype"):
+            self.warnings.append(
+                f"invalid typing.backend '{self.typing.backend}'; using 'auto'"
+            )
+            self.typing.backend = "auto"
         if self.vad.backend not in ("auto", "silero", "energy"):
             self.warnings.append(f"invalid vad.backend '{self.vad.backend}'; using 'auto'")
             self.vad.backend = "auto"

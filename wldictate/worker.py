@@ -174,6 +174,7 @@ def _run_session(
             wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
             electron_workaround=cfg.typing.electron_workaround,
             electron_classes=cfg.typing.electron_app_classes,
+            backend=cfg.typing.backend,
         ),
         on_error=lambda msg: _emit("error", msg=msg),
     )
