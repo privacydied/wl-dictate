@@ -123,6 +123,7 @@ class StreamingSession:
         self._prev_norm: list[str] = []
         self._committed_text = ""  # raw committed text (prompt context)
         self._decoded_len = 0
+        self._first_decode_done = False
         self._last_decode_t = self._clock()
         self._speculative = None
         # Correcting-mode state:
@@ -171,16 +172,24 @@ class StreamingSession:
             return  # decode in flight: skip (backpressure)
         if self._speculative is not None:
             return  # final decode already speculating on this audio
-        now = self._clock()
-        if now - self._last_decode_t < self._effective_interval():
-            return
-        if self._buffer_len - self._decoded_len < self._min_new:
-            return
         if self._buffer_len < self._min_speech:
             return
+        now = self._clock()
+        # First-paint fast path: perceived responsiveness is set by the FIRST
+        # hypothesis, so the first decode of an utterance fires the moment
+        # min_speech is buffered — skipping the cadence interval and the
+        # min_new_audio accumulation gate (together ~0.55 s of dead wait).
+        # Note the pre-roll ring means min_speech is often already buffered
+        # at utterance start. Subsequent decodes keep the normal pacing.
+        if self._first_decode_done:
+            if now - self._last_decode_t < self._effective_interval():
+                return
+            if self._buffer_len - self._decoded_len < self._min_new:
+                return
         audio = self._audio().copy()
         self._decoded_len = len(audio)
         self._last_decode_t = now
+        self._first_decode_done = True
         self._inflight = (
             self._submit_timed(audio, final=False),
             self._utterance_id,
@@ -211,6 +220,7 @@ class StreamingSession:
         if self._buffer_len < self._min_speech and not self._committed:
             return
         self._drain_inflight(block=False)
+        self._first_decode_done = True  # a decode is running: no fast path
         self._speculative = (
             self._submit_timed(self._audio().copy(), final=True),
             self._utterance_id,

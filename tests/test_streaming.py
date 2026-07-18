@@ -429,7 +429,15 @@ def test_commit_mode_finalize_returns_none():
 
 
 def test_correcting_finalize_returns_none_after_sync_failure():
-    h = CorrectingHarness([[W(" one", 0, 0.3)], [W(" one two", 0, 0.6)]])
+    # Three distinct hypotheses so a decode with NEW text (a real device
+    # write, not a no-op diff) still lands after the device starts failing.
+    h = CorrectingHarness(
+        [
+            [W(" one", 0, 0.3)],
+            [W(" one two", 0, 0.6)],
+            [W(" one two three", 0, 0.9)],
+        ]
+    )
     h.session.start_utterance()
     h.speak(1.0)
     h.device.fail = True
@@ -526,10 +534,12 @@ def test_final_decode_renders_low_confidence_words():
     script = [[W(" um", 0, 0.3, prob=0.05)]]
     h = CorrectingHarness(script)
     h.session.start_utterance()
-    h.speak(1.0)
+    # Short enough that only ONE interim decode runs: the unconfirmed
+    # low-confidence word stays gated...
+    h.speak(0.4)
     assert h.text() == ""  # gated during the live render
     h.session.finalize()
-    assert h.text() == "um"  # the final decode always renders everything
+    assert h.text() == "um"  # ...but the final decode renders everything
 
 
 def test_confidence_gate_disabled_renders_everything():
@@ -548,4 +558,66 @@ def test_confidence_gate_only_trims_the_tail():
     h.session.start_utterance()
     h.speak(1.0)
     assert h.text() == "foo bar"
+    h.session.finalize()
+
+
+# ── First-paint fast path ────────────────────────────────────────────────────
+
+
+def test_first_decode_fires_at_min_speech_without_interval_wait():
+    h = Harness([[W(" hi", 0, 0.2)]], min_speech_s=0.1, min_new_audio_s=0.3)
+    h.session.start_utterance()
+    # Feed just min_speech worth of audio with NO clock advance: the interval
+    # and min_new gates would both normally block this decode.
+    h.session.feed([np.zeros(int(0.12 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()
+    assert h.session._inflight is not None  # first decode submitted instantly
+    h.settle()
+    h.session.finalize()
+    assert h.text() == "hi"
+
+
+def test_first_decode_still_waits_for_min_speech():
+    h = Harness([[W(" hi", 0, 0.2)]], min_speech_s=0.5)
+    h.session.start_utterance()
+    h.session.feed([np.zeros(int(0.2 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()
+    assert h.session._inflight is None  # below min_speech: no decode yet
+
+
+def test_subsequent_decodes_keep_normal_pacing():
+    h = Harness(
+        [[W(" a", 0, 0.2)], [W(" a", 0, 0.2), W(" b", 0.2, 0.4)]],
+        min_speech_s=0.1,
+        min_new_audio_s=0.3,
+    )
+    h.session.start_utterance()
+    h.session.feed([np.zeros(int(0.12 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()  # fast-path first decode
+    h.settle()
+    h.session.tick()  # drain result
+    calls = len(h.fake.calls)
+    # Tiny new audio + no time advance: the second decode must NOT fire.
+    h.session.feed([np.zeros(int(0.05 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()
+    assert len(h.fake.calls) == calls
+    h.session.finalize()
+
+
+def test_fast_path_resets_per_utterance():
+    h = Harness(
+        [[W(" one", 0, 0.2)], [W(" one", 0, 0.2)], [W(" two", 0, 0.2)]],
+        min_speech_s=0.1,
+        min_new_audio_s=0.3,
+    )
+    h.session.start_utterance()
+    h.session.feed([np.zeros(int(0.12 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()
+    h.settle()
+    h.session.finalize()
+    h.session.start_utterance()
+    h.session.feed([np.zeros(int(0.12 * SAMPLE_RATE), dtype=np.float32)])
+    h.session.tick()
+    assert h.session._inflight is not None  # fast path again for utterance 2
+    h.settle()
     h.session.finalize()
