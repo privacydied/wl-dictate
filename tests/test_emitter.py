@@ -88,63 +88,18 @@ def test_make_emitter_threads_delays(monkeypatch):
     assert e._press_delay_ms == 50
 
 
-ZWSP = "​"
-
-
-def test_electron_gate_prefixes_zwsp_for_leading_space(monkeypatch):
+def test_text_passes_through_verbatim_no_zwsp(monkeypatch):
+    # The old Electron ZWSP "space gate" is gone: dropped spaces were really
+    # caused by synthetic keys at made-up scancodes (fixed in vkbd). Text
+    # must reach the device exactly as given — no invisible characters.
     cap = _Capture()
     monkeypatch.setattr(subprocess, "run", cap)
     e = WtypeEmitter(delay_ms=0)
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
     e.emit(" Testing.")
-    _, kwargs = cap.calls[0]
-    assert kwargs["input"] == ZWSP + " Testing."
-
-
-def test_electron_gate_skips_non_electron_apps(monkeypatch):
-    cap = _Capture()
-    monkeypatch.setattr(subprocess, "run", cap)
-    e = WtypeEmitter(delay_ms=0)
-    monkeypatch.setattr(e, "_focused_window_class", lambda: "kitty")
-    e.emit(" Testing.")
-    _, kwargs = cap.calls[0]
-    assert kwargs["input"] == " Testing."  # terminals never get ZWSP junk
-
-
-def test_electron_gate_skips_text_without_leading_space(monkeypatch):
-    cap = _Capture()
-    monkeypatch.setattr(subprocess, "run", cap)
-    e = WtypeEmitter(delay_ms=0)
-    called = []
-    monkeypatch.setattr(
-        e, "_focused_window_class", lambda: called.append(1) or "vesktop"
-    )
-    e.emit("Testing.")
-    _, kwargs = cap.calls[0]
-    assert kwargs["input"] == "Testing."
-    assert not called  # no window lookup unless the text starts with a space
-
-
-def test_electron_gate_disabled(monkeypatch):
-    cap = _Capture()
-    monkeypatch.setattr(subprocess, "run", cap)
-    e = WtypeEmitter(delay_ms=0, electron_workaround=False)
-    monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
-    e.emit(" Testing.")
-    _, kwargs = cap.calls[0]
-    assert kwargs["input"] == " Testing."
-
-
-def test_electron_gate_space_only_trailer(monkeypatch):
-    # end_utterance emits a lone " " — a space-only call that Electron eats
-    # entirely; the gate must save it too.
-    cap = _Capture()
-    monkeypatch.setattr(subprocess, "run", cap)
-    e = WtypeEmitter(delay_ms=0)
-    monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
     e.emit(" ")
-    _, kwargs = cap.calls[0]
-    assert kwargs["input"] == ZWSP + " "
+    assert cap.calls[0][1]["input"] == " Testing."
+    assert cap.calls[1][1]["input"] == " "
 
 
 def test_make_emitter_env_override(monkeypatch):
@@ -210,20 +165,15 @@ def test_rewrite_noop_never_shells_out(monkeypatch):
     assert cap.calls == []
 
 
-def test_rewrite_electron_gate_fires_with_and_without_backspaces(monkeypatch):
+def test_rewrite_passes_text_verbatim_with_and_without_backspaces(monkeypatch):
     cap = _Capture()
     monkeypatch.setattr(subprocess, "run", cap)
     e = WtypeEmitter(delay_ms=0)
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
-    # Pure append with leading space: gated (same as emit today).
-    assert e.rewrite(0, " x") == ZWSP + " x"
-    # Backspace-led rewrite: BackSpace does not disarm Chromium's space drop
-    # (editing keys aren't text input) — the retyped leading space needs the
-    # ZWSP gate too, or "Testing." -> "Testing testing" fuses into
-    # "Testingtesting".
-    assert e.rewrite(2, " y") == ZWSP + " y"
+    assert e.rewrite(0, " x") == " x"
+    assert e.rewrite(2, " y") == " y"
     _, kwargs = cap.calls[1]
-    assert kwargs["input"] == ZWSP + " y"
+    assert kwargs["input"] == " y"
 
 
 def test_rewrite_failure_returns_none(monkeypatch):

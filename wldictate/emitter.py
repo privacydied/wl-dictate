@@ -16,9 +16,6 @@ import sys
 import threading
 from abc import ABC, abstractmethod
 
-#: Zero-width space — invisible gate-opener for Electron's leading-space drop.
-ZWSP = "​"
-
 #: Safety cap on backspaces per sync: a pathological diff rewrites at most the
 #: last N physical characters instead of machine-gunning the whole utterance.
 _MAX_BACKSPACES = 500
@@ -43,9 +40,8 @@ class Emitter(ABC):
     def rewrite(self, backspaces: int, text: str) -> str | None:
         """Delete ``backspaces`` characters, then type ``text``, atomically.
 
-        Returns the *physically typed* string (which may differ from ``text``,
-        e.g. an Electron ZWSP prefix), or None on failure. Default: devices
-        that cannot delete just emit the text (best effort).
+        Returns the typed string, or None on failure. Default: devices that
+        cannot delete just emit the text (best effort).
         """
         return text if self.emit(text) else None
 
@@ -176,14 +172,15 @@ class WtypeEmitter(Emitter):
 
     Preferred device is a persistent in-process virtual keyboard (see
     ``wldictate.vkbd``): one Wayland connection for the worker lifetime, no
-    per-rewrite process spawn, and no fresh-connection Electron space drop.
-    The wtype subprocess remains as the always-available fallback (and the
-    default for bare construction, so tests and non-worker callers never
-    touch the live compositor).
-    """
+    per-rewrite process spawn, and every key at its real evdev scancode so
+    scancode-sensitive apps (Chromium/Electron) accept it. The wtype
+    subprocess remains as the always-available fallback (and the default
+    for bare construction, so tests and non-worker callers never touch the
+    live compositor).
 
-    #: Invisible gate-opener for Electron's leading-space drop (see rewrite()).
-    _ZWSP = ZWSP
+    ``electron_workaround``/``electron_classes`` gate the clipboard-paste
+    fast path for large replacements (see ``rewrite_bulk``).
+    """
 
     def __init__(
         self,
@@ -237,24 +234,6 @@ class WtypeEmitter(Emitter):
         """Window class of the focused window ("" if unknown / not Hyprland)."""
         return focused_window(self._env)[0]
 
-    def _needs_electron_gate(self, text: str) -> bool:
-        """True when the leading space of ``text`` would be eaten by the
-        focused window.
-
-        Chromium/Electron apps drop SPACE keys at the start of every fresh
-        wtype connection — regardless of -s/-d delays — fusing dictated words
-        ("TestingTesting"). An invisible zero-width space typed first "opens
-        the gate" so the real space lands. Only applied when the focused
-        window class matches a known Electron app, so terminals and editors
-        never receive ZWSP characters.
-        """
-        if not self._electron_workaround or not text.startswith(" "):
-            return False
-        focused = self._focused_window_class().lower()
-        if not focused:
-            return False
-        return any(cls in focused for cls in self._electron_classes)
-
     def emit(self, text: str) -> bool:
         if not text:
             return True
@@ -266,26 +245,14 @@ class WtypeEmitter(Emitter):
         wtype processes argv sequentially, so the BackSpace keys land before
         the stdin text (the trailing ``-``). ``-d`` paces only *text* typing;
         keys are paced by interleaving ``-s`` before each BackSpace (Electron
-        drops keys that arrive too fast). Returns the physically typed string
-        (ZWSP prefix included when the Electron gate fires) or None on error.
+        drops keys that arrive too fast). Returns the typed string or None
+        on error.
         """
         backspaces = max(0, backspaces)
         if backspaces == 0 and not text:
             return ""
         vk = self._vkbd()
         if vk is not None:
-            # Electron gate per EMISSION, exactly like the wtype path.
-            # (Empirically Chromium re-arms the leading-space drop per input
-            # burst, not per connection — gating only the first key of the
-            # persistent connection brought the glitch back: "YoWhat'the".)
-            # Backspace-led rewrites need the gate too: BackSpace is an
-            # editing key, not a text-producing one, and does NOT disarm the
-            # re-armed drop — "Testing." -> "Testing testing" backspaces the
-            # "." then retypes " testing", and the space was eaten
-            # ("Testingtesting"). The extra ZWSP is invisible, tracked in the
-            # correcting emitter, and cleaned up by later diffs.
-            if self._needs_electron_gate(text):
-                text = self._ZWSP + text
             sent_before = vk.keys_sent
             try:
                 vk.type_backspaces(backspaces, self._delay_ms)
@@ -296,12 +263,6 @@ class WtypeEmitter(Emitter):
                 if vk.keys_sent != sent_before:
                     return None  # keys may have landed: screen state unknown
                 # Nothing was delivered — safe to retry via the subprocess.
-        # Same gate on the subprocess path: BackSpace keys do not disarm
-        # Chromium's space drop (editing keys aren't text input), so a
-        # backspace-led rewrite whose retyped suffix starts with a space
-        # still needs the ZWSP.
-        if self._needs_electron_gate(text):
-            text = self._ZWSP + text
         # Pass text on stdin via wtype's "-" placeholder rather than as an
         # argv word: text that begins with "-" (e.g. a spoken dash) would
         # otherwise be misparsed as a flag ("Missing argument to -foo").
@@ -451,8 +412,7 @@ class WtypeEmitter(Emitter):
 class CorrectingEmitter(Emitter):
     """Rewrites tentative text in place (live self-correcting mode).
 
-    Tracks the *physical* characters typed for the current utterance
-    (including invisible ZWSPs the Electron gate injects) and syncs the
+    Tracks the characters typed for the current utterance and syncs the
     screen to a desired string via a minimal common-prefix diff: backspace
     the divergent suffix, retype the new one. Never backspaces past what the
     current utterance typed, so text finalized before ``begin_utterance()``
@@ -461,7 +421,7 @@ class CorrectingEmitter(Emitter):
 
     def __init__(self, device: Emitter) -> None:
         self._device = device
-        self._screen = ""  # physical chars typed this utterance (may hold ZWSP)
+        self._screen = ""  # chars typed this utterance
         # Physical text of the PREVIOUS utterance (one level of history) —
         # enables revise-in-place and "scratch that" to reach back across the
         # baseline. Cleared whenever screen state becomes unknown.
@@ -500,13 +460,10 @@ class CorrectingEmitter(Emitter):
         self._prev_screen = ""
         return True
 
-    def _logical(self) -> str:
-        return self._screen.replace(ZWSP, "")
-
     @property
     def logical(self) -> str:
-        """Visible text of the current mutable region (ZWSPs excluded)."""
-        return self._logical()
+        """Text of the current mutable region."""
+        return self._screen
 
     def sync(
         self,
@@ -526,31 +483,20 @@ class CorrectingEmitter(Emitter):
         if self._frozen:
             return False
         cap = _MAX_BACKSPACES if max_backspaces is None else max_backspaces
-        logical = self._logical()
-        # Longest common prefix (logical view — ZWSPs are invisible).
+        # Longest common prefix.
         p = 0
-        for a, b in zip(logical, desired):
+        for a, b in zip(self._screen, desired):
             if a != b:
                 break
             p += 1
-        # Map logical prefix length -> physical index. A ZWSP gating a kept
-        # char stays with the kept prefix; a ZWSP *at* the boundary gated a
-        # now-deleted char, so it is deleted too (no stranded invisibles).
-        phys = 0
-        remaining = p
-        while phys < len(self._screen) and remaining > 0:
-            if self._screen[phys] != ZWSP:
-                remaining -= 1
-            phys += 1
-        backspaces = len(self._screen) - phys
+        backspaces = len(self._screen) - p
         suffix = desired[p:]
         if backspaces > cap:
             # Pathological rewrite: keep the (possibly wrong) older prefix and
-            # rewrite only the last ``cap`` physical chars.
-            phys = len(self._screen) - cap
+            # rewrite only the last ``cap`` chars.
+            p = len(self._screen) - cap
             backspaces = cap
-            kept_logical = len(self._screen[:phys].replace(ZWSP, ""))
-            suffix = desired[kept_logical:]
+            suffix = desired[p:]
         if backspaces == 0 and not suffix:
             return True
         if bulk:
@@ -560,14 +506,14 @@ class CorrectingEmitter(Emitter):
         if typed is None:
             self._frozen = True  # some keys may have landed: state unknown
             return False
-        self._screen = self._screen[:phys] + typed
+        self._screen = self._screen[:p] + typed
         return True
 
     def emit(self, text: str) -> bool:
         """Append-only compatibility path (tracked so later syncs can fix it)."""
         if not text:
             return True
-        return self.sync(self._logical() + text)
+        return self.sync(self._screen + text)
 
     def press_key(self, keysym: str) -> bool:
         return self._device.press_key(keysym)
@@ -577,8 +523,8 @@ class CorrectingEmitter(Emitter):
 
     @property
     def previous_logical(self) -> str:
-        """Visible text of the previous utterance's region."""
-        return self._prev_screen.replace(ZWSP, "")
+        """Text of the previous utterance's region."""
+        return self._prev_screen
 
     def reset_regions(self) -> None:
         """Screen ownership ended (e.g. Return sent a chat message): nothing

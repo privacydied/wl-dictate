@@ -2,22 +2,21 @@
 
 Every wtype invocation pays fork+exec, a fresh Wayland connect, and the
 virtual-keyboard handshake — dozens of times per utterance in correcting
-mode. Worse, Chromium/Electron drops leading SPACE keys at the start of
-every *fresh* connection, which is the entire reason the ZWSP workaround in
-the emitter exists.
+mode. This module speaks the Wayland wire protocol directly (no
+dependencies) and keeps ONE virtual keyboard alive for the worker's
+lifetime — the same first-principles move as ``persistent_capture`` for
+the microphone: negotiate once, never again. Typing a rewrite becomes a
+handful of small socket writes instead of a process spawn.
 
-This module speaks the Wayland wire protocol directly (no dependencies) and
-keeps ONE virtual keyboard alive for the worker's lifetime — the same
-first-principles move as ``persistent_capture`` for the microphone:
-negotiate once, never again. Typing a rewrite becomes a handful of small
-socket writes instead of a process spawn.
-
-Keymap strategy (same as wtype): a generated xkb keymap maps one keycode
-per distinct keysym; codepoints are written in xkbcommon's ``U+XXXX``
-keysym form, named keys ("Return", "BackSpace", …) by name. Unlike wtype,
-the keymap grows incrementally — new characters trigger a keymap re-upload
-on the live connection; a full rebuild evicts stale entries if it ever
-fills up.
+Keymap strategy (unlike wtype, which invents keycodes): every key that
+exists on a physical US keyboard sits at its REAL evdev scancode, with
+shifted characters as a second shift level on their base key — because
+Chromium derives DOM ``event.code`` from the scancode (not the keymap) and
+apps break on synthetic input at made-up codes (Discord dropped every
+space), while scancode-matching consumers (compositor media binds, logind)
+can fire on them (a capital 'I' at KEY_MUTE muted the audio). Exotic
+unicode allocates LRU slots from the few scancodes the kernel leaves
+undefined, re-uploading the keymap on demand.
 
 Everything here is best-effort: any failure raises, and the emitter falls
 back to the wtype subprocess path (see ``WtypeEmitter``).

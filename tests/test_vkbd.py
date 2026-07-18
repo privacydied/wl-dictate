@@ -5,7 +5,7 @@ import struct
 import pytest
 
 import wldictate.vkbd as vkbd_mod
-from wldictate.emitter import ZWSP, WtypeEmitter
+from wldictate.emitter import WtypeEmitter
 from wldictate.vkbd import WaylandVirtualKeyboard, _marshal_string, _pad
 
 
@@ -209,23 +209,15 @@ def test_rewrite_partial_delivery_returns_none(fake_vkbd, monkeypatch):
     assert e.rewrite(0, "hello") is None
 
 
-def test_electron_gate_fires_per_emission(fake_vkbd, monkeypatch):
-    # Chromium re-arms the leading-space drop per input burst, so EVERY pure
-    # append with a leading space into an Electron app gets the ZWSP —
-    # identical to the wtype-subprocess behavior.
+def test_emissions_pass_through_verbatim(fake_vkbd, monkeypatch):
+    # No ZWSP gate: spaces land because every key is at its real evdev
+    # scancode. Emissions reach the device exactly as given.
     e = WtypeEmitter(backend="auto", delay_ms=0)
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
-    assert e.rewrite(0, " one") == ZWSP + " one"
-    assert e.rewrite(0, " two") == ZWSP + " two"
-    # Backspace-led rewrites need the gate too: BackSpace is an editing key
-    # and does NOT disarm Chromium's re-armed space drop ("Testingtesting").
-    assert e.rewrite(2, " three") == ZWSP + " three"
+    assert e.rewrite(0, " one") == " one"
+    assert e.rewrite(2, " two") == " two"
     typed = [c for c in fake_vkbd.calls if c[0] == "text"]
-    assert typed == [
-        ("text", ZWSP + " one"),
-        ("text", ZWSP + " two"),
-        ("text", ZWSP + " three"),
-    ]
+    assert typed == [("text", " one"), ("text", " two")]
 
 
 def test_press_key_routes_through_vkbd(fake_vkbd, monkeypatch):

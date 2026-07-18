@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from wldictate.emitter import ZWSP, CorrectingEmitter, Emitter
+from wldictate.emitter import CorrectingEmitter, Emitter
 import wldictate.emitter as emitter_mod
 
 
 class FakeDevice(Emitter):
-    """Records (backspaces, text) ops; optionally rewrites the physical text
-    (e.g. injecting a ZWSP like the Electron gate) or fails."""
+    """Records (backspaces, text) ops; optionally rewrites the typed text
+    or fails."""
 
     def __init__(self):
         self.ops: list[tuple[int, str]] = []
@@ -63,38 +63,6 @@ def test_clear_screen():
     ce.sync("oops")
     ce.sync("")
     assert dev.ops[-1] == (4, "")
-
-
-def _gate(dev: FakeDevice) -> None:
-    """Make the device behave like the Electron ZWSP gate on pure appends."""
-    dev.transform = (
-        lambda n, text: (ZWSP + text) if n == 0 and text.startswith(" ") else text
-    )
-
-
-def test_zwsp_at_boundary_is_deleted_with_its_gated_text():
-    ce, dev = make()
-    _gate(dev)
-    ce.sync("hi")
-    ce.sync("hi there")  # device physically types ZWSP + " there"
-    dev.transform = lambda n, text: text
-    # Divergence right at the gated space: the ZWSP gated deleted text, so it
-    # is deleted too — 6 logical chars but 7 physical backspaces, and no
-    # invisible ZWSP is stranded inside "hi!".
-    ce.sync("hi!")
-    assert dev.ops[-1] == (7, "!")
-
-
-def test_zwsp_gating_kept_text_is_kept():
-    ce, dev = make()
-    _gate(dev)
-    ce.sync("hi")
-    ce.sync("hi there")
-    dev.transform = lambda n, text: text
-    # Kept prefix "hi th" spans the gated space: the ZWSP stays (still needed
-    # to have gated the kept space), only "ere" is rewritten.
-    ce.sync("hi thus")
-    assert dev.ops[-1] == (3, "us")
 
 
 def test_begin_utterance_resets_baseline():

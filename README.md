@@ -183,14 +183,15 @@ Useful knobs:
   after a pause; default true. Set `false` to keep the model's raw casing.
 - `typing.wtype_delay_ms` — per-keystroke delay for `wtype` (default 6).
   Set 0 for maximum speed if nothing drops characters.
-- `typing.electron_workaround` — Chromium/Electron apps (Vesktop, Discord,
-  Slack, …) eat leading **space** keys on every fresh `wtype` connection —
-  no delay fixes it — so dictated words fuse ("TestingTesting"). When the
-  focused window class matches `typing.electron_app_classes`, commits that
-  start with a space get an invisible zero-width-space prefix that "opens the
-  gate" so the real space lands. Default true; only ever applied to matching
-  apps, so terminals/editors never receive ZWSP characters. Add your app's
-  window class to `electron_app_classes` if another Electron app fuses words.
+- `typing.electron_workaround` — when the focused window class matches
+  `typing.electron_app_classes` (Vesktop, Discord, Slack, …), large one-shot
+  replacements (contextual transforms) are delivered as a clipboard paste
+  (Ctrl+V) instead of keystroked — Electron apps are the slowest to
+  keystroke into and reliably paste-capable; terminals/editors always
+  keystroke. Default true. (The old zero-width-space "space gate" is gone:
+  Electron's dropped spaces were actually caused by synthetic keys at
+  made-up scancodes, fixed for good by typing every key at its real evdev
+  scancode.)
 - `contextual.*` — contextual dictation (see the section above): `profile` selects the LLM endpoint, `timeout_s` bounds each transform, `context_max_chars` caps selection/clipboard context, `notify` controls toasts.
 - `vad.min_silence_ms` — how long a pause ends an utterance.
 - `vad.speculative_silence_ms` — **speculative finalize**: after this much silence the final decode starts early, so when the pause reaches `min_silence_ms` the result is already computed — final text lands the instant the utterance ends. Resuming speech discards the speculation (some GPU time wasted, nothing else). 0 disables.

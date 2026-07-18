@@ -127,12 +127,11 @@ class TypingConfig:
     # drop (see electron_workaround below) — kept as a knob for other slow
     # compositor paths. 0 = disabled.
     wtype_press_delay_ms: int = 0
-    # Chromium/Electron apps drop leading SPACE keys on every fresh wtype
-    # connection (regardless of delays), fusing words: "TestingTesting".
-    # Workaround: when the focused window is one of electron_app_classes and
-    # the text starts with a space, prefix an invisible zero-width space
-    # (U+200B) — it "opens the gate" so the real space lands. Only applied to
-    # matching apps so terminals/editors never receive ZWSP junk.
+    # When the focused window is one of electron_app_classes, large one-shot
+    # replacements (contextual transforms) are delivered as a clipboard
+    # paste (Ctrl+V) instead of keystroked — Electron apps are the slowest
+    # to keystroke into AND reliably paste-capable. Terminals/editors always
+    # keystroke (Ctrl+V is not paste there).
     electron_workaround: bool = True
     electron_app_classes: list[str] = field(
         default_factory=lambda: [
