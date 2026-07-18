@@ -5,7 +5,10 @@
 [server]
 # Any llama.cpp -hf spec (hf repo:quant). For vision context ("reply to this"
 # reading the screen) pick a model that ships an mmproj.
-model = "unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M"
+# Set model = "auto" to pick the largest tier that fits this machine's VRAM/RAM
+# (see `wl-dictate --check-models`); handy for a config shared across a desktop
+# GPU and a laptop.
+model = "unsloth/Qwen3.5-9B-MTP-GGUF:Q6_K"
 alias = "qwen3.5-9b"  # keep in sync with contextual.profiles.local.model
 port = 8890
 ctx_size = 16384      # dictation transforms need ~16k, not the native window

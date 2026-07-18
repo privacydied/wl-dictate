@@ -313,9 +313,25 @@ def run() -> int:
     for warning in cfg.warnings:
         _log(f"config: {warning}")
 
-    _log(f"loading model '{cfg.model}'...")
+    # Pick a contextual profile this machine can actually run (a laptop can't
+    # serve the 9B local model): downgrade to a smaller local model or a cloud
+    # profile before the first transform, so it fails loudly here, not silently
+    # on connect.
+    from .hardware import autoselect_profile, resolve_whisper_model
+
+    for note in autoselect_profile(cfg.contextual):
+        _log(f"contextual: {note}")
+
+    # Resolve model="auto" to a concrete Whisper model for THIS machine's GPU/
+    # CPU (large-v3 on a big GPU, base.en on a CPU laptop) — so one config is
+    # portable across machines.
+    whisper_model, whisper_note = resolve_whisper_model(cfg.model)
+    if whisper_note:
+        _log(f"transcription: {whisper_note}")
+
+    _log(f"loading model '{whisper_model}'...")
     transcriber = FasterWhisperTranscriber(
-        model_name=cfg.model,
+        model_name=whisper_model,
         device=cfg.device,
         compute_type=cfg.compute_type,
         # Vocabulary biases Whisper decoding in BOTH dictation modes.

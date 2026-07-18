@@ -7,9 +7,10 @@ Usage (source):
     python wl_dictate.py --toggle-contextual  # toggle contextual (LLM) dictation
     python wl_dictate.py --hold-start[-contextual] / --hold-stop  # push-to-talk
     python wl_dictate.py --devices    # list input devices
+    python wl_dictate.py --check-models  # report which contextual models fit this machine
 
 Usage (compiled binary):
-    wl-dictate [--worker|--toggle|--toggle-contextual|--devices]
+    wl-dictate [--worker|--toggle|--toggle-contextual|--devices|--check-models]
 """
 
 from __future__ import annotations
@@ -76,6 +77,12 @@ def main() -> None:
         from wldictate.toggle import main as toggle_main
 
         sys.exit(toggle_main(args[0].lstrip("-")))
+
+    elif args and args[0] == "--check-models":
+        from wldictate.hardware import main as hardware_main
+
+        # Pass through --pick-model / --json; bare --check-models -> report.
+        sys.exit(hardware_main(args[1:]))
 
     elif args and args[0] == "--devices":
         from wldictate.audio import list_input_devices

@@ -126,6 +126,21 @@ draft_min = 0
 
 Environment variables (`PORT`, `CTX_SIZE`, `MTP_DRAFT_MAX`, …) override the TOML. MTP speculative decoding is the big generation-speed multiplier; the log prints per-request `draft acceptance` — consistently high (>0.5) → raise `draft_max`, consistently low (<0.2) → lower it.
 
+**Right-sizing the model to the machine**: the default `local` profile serves a 9B model — great on a desktop GPU, too big for a laptop. `wl-dictate --check-models` reports detected VRAM/RAM and which tiers and profiles fit:
+
+```
+$ wl-dictate --check-models
+Hardware:
+  GPU : none detected
+  RAM : 15772 MB
+Local model tiers:
+  9b    Qwen3.5-9B    needs 8000 MB VRAM / 12000 MB RAM  -> OK (CPU, slow)
+  4b    Qwen3.5-4B    needs 4200 MB VRAM / 6000 MB RAM   -> OK (CPU, slow)
+  ...
+```
+
+The worker acts on this automatically: `contextual.auto_select` (default **true**) keeps your configured profile if this machine can run it, otherwise falls back to the largest local model that fits, then to a cloud profile — so the same config works on both a desktop and a laptop. Set `auto_select: false` (or `WL_DICTATE_NO_AUTOSELECT=1`) to always honour `profile` as-is. Set `model = "auto"` in `llama.toml` to have the launch script pick the largest local GGUF that fits (`wl-dictate --check-models --pick-model`). Tune the VRAM/RAM floors in `wldictate/hardware.py` (`LOCAL_MODEL_TIERS`).
+
 **API keys** (cloud profiles): the key file is the systemd-friendly path —
 
 ```sh
@@ -156,7 +171,7 @@ or set the env var (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) via a systemd drop-i
 
 Useful knobs:
 
-- `model` — any faster-whisper model id (`tiny.en`, `base.en`, `small.en`, `distil-small.en`, …). Bigger models are still realtime on a decent GPU.
+- `model` — any faster-whisper model id (`tiny.en`, `base.en`, `small.en`, `distil-small.en`, …). Bigger models are still realtime on a decent GPU. Set `model: "auto"` to have the worker pick per-machine from detected hardware (large-v3 on a big GPU → … → `base.en` on a CPU laptop), so one config is portable across a desktop and a laptop — see `wl-dictate --check-models`.
 - `streaming.enabled: false` — revert to type-after-you-pause batch behavior.
 - `typing.mode` — `"correcting"` (default): words appear instantly and are
   fixed in place via backspace + retype as the hypothesis refines. Corrections

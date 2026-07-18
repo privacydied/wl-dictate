@@ -200,6 +200,11 @@ class ContextualConfig:
     """Contextual dictation (Ctrl+Alt+D): LLM transform of each utterance."""
 
     profile: str = "local"  # key into profiles — switching endpoints is one field
+    # Auto-pick a runnable profile at worker startup: if the configured profile
+    # is a local model this machine can't run (checked against detected VRAM/
+    # RAM), fall back to the largest local model that fits, then to a cloud
+    # profile. Set false to always honour ``profile`` as-is.
+    auto_select: bool = True
     timeout_s: float = 10.0  # whole LLM budget; on timeout the Whisper text stays
     max_output_tokens: int = 1000
     context_max_chars: int = 4000  # per-source cap for selection/clipboard
@@ -236,6 +241,7 @@ class ContextualConfig:
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "profile": self.profile,
+            "auto_select": self.auto_select,
             "timeout_s": self.timeout_s,
             "max_output_tokens": self.max_output_tokens,
             "context_max_chars": self.context_max_chars,
@@ -254,6 +260,7 @@ class ContextualConfig:
         """Merge a user-provided section over the defaults, with type checks."""
         scalar_types = {
             "profile": str,
+            "auto_select": bool,
             "timeout_s": (int, float),
             "max_output_tokens": int,
             "context_max_chars": int,

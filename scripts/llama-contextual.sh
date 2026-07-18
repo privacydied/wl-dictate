@@ -38,6 +38,18 @@ PY
 
 MODEL="${MODEL:-$TOML_MODEL}"
 ALIAS="${ALIAS:-$TOML_ALIAS}"
+
+# model = "auto": let hardware detection pick the largest local GGUF that fits
+# this machine's VRAM/RAM (same tier logic as `wl-dictate --check-models`).
+if [ "$MODEL" = "auto" ]; then
+  PICKED="$(cd "$SCRIPT_DIR/.." && python3 -m wldictate.hardware --pick-model || true)"
+  if [ -z "$PICKED" ]; then
+    echo "llama-contextual: no local model fits this machine; use a cloud" \
+         "contextual profile instead (wl-dictate --check-models)" >&2
+    exit 1
+  fi
+  MODEL="$PICKED"
+fi
 PORT="${PORT:-$TOML_PORT}"
 CTX_SIZE="${CTX_SIZE:-$TOML_CTX}"
 MTP_ENABLED="${MTP_ENABLED:-$TOML_MTP_ENABLED}"
@@ -70,14 +82,14 @@ exec llama-server \
   --ctx-size "$CTX_SIZE" \
   --parallel 1 \
   --flash-attn on \
-  --cache-type-k q4_0 \
-  --cache-type-v q4_0 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
   --kv-offload \
   --jinja \
   --cache-prompt \
   --cache-reuse 1024 \
   --reasoning off \
   --reasoning-budget 0 \
-  --temp 1 --top-p 0.8 --top-k 20 --min-p 0.0 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 \
   --metrics \
   "${MTP_ARGS[@]}"
