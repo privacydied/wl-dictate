@@ -42,9 +42,34 @@ _KEYMAP_FORMAT_XKB_V1 = 1
 #: (Shift=1, Lock=2, Control=4, Mod1..Mod5).
 MOD_CONTROL = 4
 
-#: Keymap capacity before a full rebuild evicts unused entries. Dictation
-#: uses well under 150 distinct characters; this is just a safety bound.
-_MAX_ENTRIES = 512
+#: Real evdev scancodes (wire codes) for keysyms that exist on a physical US
+#: keyboard, plus the named keys. Chromium derives DOM ``event.code`` from
+#: the evdev scancode — NOT from the uploaded keymap — and apps that check
+#: it break on synthetic input at made-up scancodes: Discord's editor
+#: silently ignores a space whose scancode isn't KEY_SPACE, so EVERY
+#: synthetic space vanished (ZWSP gate or not, vkbd and wtype alike).
+#: Placing these keys at their physical scancodes makes synthetic input
+#: indistinguishable from a real keyboard. Keysyms with no physical key
+#: (shifted chars, exotic unicode) get allocator codes — they are delivered
+#: by keysym and land fine anywhere.
+_EVDEV_CODES: dict[str, int] = {"Escape": 1, "BackSpace": 14, "Tab": 15, "Return": 28}
+for _chars, _base in (
+    ("1234567890-=", 2),  # KEY_1 .. KEY_EQUAL
+    ("qwertyuiop[]", 16),  # KEY_Q .. KEY_RIGHTBRACE
+    ("asdfghjkl;'`", 30),  # KEY_A .. KEY_GRAVE
+    ("\\zxcvbnm,./", 43),  # KEY_BACKSLASH .. KEY_SLASH
+):
+    for _i, _ch in enumerate(_chars):
+        _EVDEV_CODES[f"0x{ord(_ch):08x}"] = _base + _i
+_EVDEV_CODES["0x00000020"] = 57  # KEY_SPACE
+del _chars, _base, _i, _ch
+
+#: Wire codes for keysyms without a physical key allocate upward from here —
+#: clear of the whole physical main block (incl. modifiers, whose DomCodes
+#: must never be squatted on).
+_ALLOC_BASE = 90
+#: Highest usable wire code: xkb keycode = wire + 8 must stay ≤ 255.
+_MAX_CODE = 247
 
 
 class VkbdUnavailable(RuntimeError):
@@ -106,9 +131,9 @@ class WaylandVirtualKeyboard:
         self._callbacks: set[int] = set()  # ids of in-flight wl_callbacks
         self._done_callbacks: set[int] = set()
         self._globals: dict[str, tuple[int, int]] = {}  # iface -> (name, version)
-        #: keysym spec -> evdev keycode (index in _entries + 1)
+        #: keysym spec -> wire code (evdev scancode; xkb keycode = code + 8)
         self._sym_code: dict[str, int] = {}
-        self._entries: list[str] = []
+        self._alloc_next = _ALLOC_BASE
         #: total key events delivered on this connection (the Electron
         #: fresh-connection gate is open once this is > 0).
         self.keys_sent = 0
@@ -282,43 +307,56 @@ class WaylandVirtualKeyboard:
         keysym = cp if 0x20 <= cp <= 0x7E else 0x01000000 | cp
         return f"0x{keysym:08x}"
 
+    def _next_free(self) -> int | None:
+        """Next unused allocator wire code, or None when full."""
+        code = self._alloc_next
+        used = set(self._sym_code.values())
+        while code <= _MAX_CODE and code in used:
+            code += 1
+        if code > _MAX_CODE:
+            return None
+        self._alloc_next = code + 1
+        return code
+
     def _add_syms(self, syms: list[str]) -> bool:
         added = False
         for sym in syms:
             if sym in self._sym_code:
                 continue
-            if len(self._entries) >= _MAX_ENTRIES:
-                # Full: rebuild with only the syms needed right now.
-                keep = [s for s in syms if s in self._sym_code] + [
-                    s for s in syms if s not in self._sym_code
-                ]
-                self._entries = list(dict.fromkeys(keep))
-                self._sym_code = {
-                    s: i + 1 for i, s in enumerate(self._entries)
-                }
-                return True
-            self._entries.append(sym)
-            self._sym_code[sym] = len(self._entries)
+            code = _EVDEV_CODES.get(sym)
+            if code is None:
+                code = self._next_free()
+                if code is None:
+                    # Allocator full: rebuild with only the syms needed now
+                    # (physical keys keep their real scancodes by definition).
+                    self._sym_code = {}
+                    self._alloc_next = _ALLOC_BASE
+                    for s in dict.fromkeys(syms):
+                        c = _EVDEV_CODES.get(s)
+                        self._sym_code[s] = c if c is not None else self._next_free()
+                    return True
+            self._sym_code[sym] = code
             added = True
         return added
 
     def keymap_text(self) -> str:
+        items = sorted(self._sym_code.items(), key=lambda kv: kv[1])
         lines = [
             "xkb_keymap {",
             'xkb_keycodes "(unnamed)" {',
             "minimum = 8;",
-            f"maximum = {len(self._entries) + 9};",
+            "maximum = 255;",
         ]
-        for i in range(len(self._entries)):
-            lines.append(f"<K{i + 1}> = {i + 9};")
+        for _sym, code in items:
+            lines.append(f"<K{code}> = {code + 8};")
         lines += [
             "};",
             'xkb_types "(unnamed)" { include "complete" };',
             'xkb_compatibility "(unnamed)" { include "complete" };',
             'xkb_symbols "(unnamed)" {',
         ]
-        for i, sym in enumerate(self._entries):
-            lines.append(f"key <K{i + 1}> {{[{sym}]}};")
+        for sym, code in items:
+            lines.append(f"key <K{code}> {{[{sym}]}};")
         lines += ["};", "};", ""]
         return "\n".join(lines)
 

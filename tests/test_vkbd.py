@@ -28,7 +28,7 @@ def bare_vkbd():
     """A WaylandVirtualKeyboard with no socket: exercises keymap logic only."""
     vk = WaylandVirtualKeyboard.__new__(WaylandVirtualKeyboard)
     vk._sym_code = {}
-    vk._entries = []
+    vk._alloc_next = vkbd_mod._ALLOC_BASE
     return vk
 
 
@@ -42,36 +42,45 @@ def test_sym_for_char_uses_hex_keysyms_and_named_keys():
     assert WaylandVirtualKeyboard._sym_for_char("\t") == "Tab"
 
 
-def test_keymap_text_matches_wtype_layout():
+def test_keymap_text_uses_real_scancodes():
     vk = bare_vkbd()
-    vk._add_syms(["0x00000041", "Return"])
+    vk._add_syms(["0x00000041", "Return"])  # 'A' (shifted: allocator), Return
     text = vk.keymap_text()
     assert "minimum = 8;" in text
-    assert "maximum = 11;" in text  # 2 entries -> len + 9
-    assert "<K1> = 9;" in text
-    assert "<K2> = 10;" in text
-    assert "key <K1> {[0x00000041]};" in text
-    assert "key <K2> {[Return]};" in text
+    assert "maximum = 255;" in text
+    # Return sits at its REAL evdev scancode (KEY_ENTER=28 -> xkb 36):
+    # Chromium derives event.code from the scancode, not the keymap.
+    assert "<K28> = 36;" in text
+    assert "key <K28> {[Return]};" in text
+    # 'A' has no unshifted physical key: allocator range, clear of the
+    # physical main block.
+    assert f"<K{vkbd_mod._ALLOC_BASE}> = {vkbd_mod._ALLOC_BASE + 8};" in text
+    assert f"key <K{vkbd_mod._ALLOC_BASE}> {{[0x00000041]}};" in text
     assert 'xkb_types "(unnamed)" { include "complete" };' in text
     assert 'xkb_compatibility "(unnamed)" { include "complete" };' in text
 
 
-def test_add_syms_assigns_stable_evdev_codes():
+def test_physical_keys_get_real_evdev_codes():
     vk = bare_vkbd()
-    assert vk._add_syms(["0x00000061", "0x00000062"]) is True
-    assert vk._sym_code == {"0x00000061": 1, "0x00000062": 2}
+    vk._add_syms(["0x00000020", "0x00000061", "BackSpace", "0x00000041"])
+    assert vk._sym_code["0x00000020"] == 57  # KEY_SPACE — the Discord fix
+    assert vk._sym_code["0x00000061"] == 30  # 'a' at KEY_A
+    assert vk._sym_code["BackSpace"] == 14  # KEY_BACKSPACE
+    assert vk._sym_code["0x00000041"] == vkbd_mod._ALLOC_BASE  # 'A': allocator
     assert vk._add_syms(["0x00000061"]) is False  # already mapped
-    assert vk._add_syms(["0x00000063"]) is True
-    assert vk._sym_code["0x00000063"] == 3
 
 
 def test_add_syms_evicts_on_overflow(monkeypatch):
-    monkeypatch.setattr(vkbd_mod, "_MAX_ENTRIES", 4)
+    monkeypatch.setattr(vkbd_mod, "_MAX_CODE", vkbd_mod._ALLOC_BASE + 1)
     vk = bare_vkbd()
-    vk._add_syms(["a", "b", "c", "d"])
-    assert vk._add_syms(["d", "e"]) is True  # overflow: rebuild
-    assert set(vk._sym_code) == {"d", "e"}
-    assert len(vk._entries) == 2
+    vk._add_syms(["s1", "s2"])  # exotic syms: fill both allocator codes
+    assert vk._add_syms(["s2", "s3"]) is True  # overflow: rebuild
+    assert set(vk._sym_code) == {"s2", "s3"}
+    # Physical keys always keep their real codes through a rebuild.
+    vk2 = bare_vkbd()
+    vk2._add_syms(["s1", "s2"])
+    assert vk2._add_syms(["0x00000020", "s3"]) is True
+    assert vk2._sym_code["0x00000020"] == 57
 
 
 def test_registry_global_event_parsing():
