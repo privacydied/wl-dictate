@@ -39,7 +39,14 @@ SAMPLE_RATE = 16000
 
 _SENTENCE_END = (".", "!", "?")
 _PROMPT_TAIL_CHARS = 200
-_FINAL_DECODE_TIMEOUT_S = 30.0
+#: Budget for one final decode. The decode window is bounded by
+#: streaming.max_buffer_s (≤ 30 s of audio); a machine that can't decode
+#: that in 10 s can't run this pipeline in real time anyway — waiting
+#: longer would only wedge finalize(). Public because the worker derives
+#: its session-thread join timeout from it: finalize() can wait for at most
+#: TWO of these back-to-back (a timed-out speculative decode followed by a
+#: fresh one), so worst-case finalize ≈ 2 × FINAL_DECODE_TIMEOUT_S.
+FINAL_DECODE_TIMEOUT_S = 10.0
 
 
 def _normalize(text: str) -> str:
@@ -234,13 +241,13 @@ class StreamingSession:
         words: list[Word] | None = None
         if spec is not None and spec[1] == self._utterance_id:
             try:
-                words = spec[0].result(timeout=_FINAL_DECODE_TIMEOUT_S)
+                words = spec[0].result(timeout=FINAL_DECODE_TIMEOUT_S)
             except Exception:
                 words = None  # fall through to a fresh final decode
         try:
             if words is None:
                 future = self._submit_timed(self._audio(), final=True)
-                words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
+                words = future.result(timeout=FINAL_DECODE_TIMEOUT_S)
         except Exception as e:
             self._error(f"final decode failed: {e}")
             if self._correcting and self._last_raw:
@@ -299,7 +306,7 @@ class StreamingSession:
             return
         self._inflight = None
         try:
-            words = future.result(timeout=_FINAL_DECODE_TIMEOUT_S)
+            words = future.result(timeout=FINAL_DECODE_TIMEOUT_S)
         except Exception as e:
             self._error(f"decode failed: {e}")
             return

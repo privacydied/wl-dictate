@@ -19,7 +19,7 @@ from .commands import match_command, strip_literal
 from .config import Config
 from .emitter import CorrectingEmitter, make_emitter
 from .render import RenderProxy
-from .streaming import StreamingSession
+from .streaming import FINAL_DECODE_TIMEOUT_S, StreamingSession
 from .textproc import TextFormatter
 from .transcriber import FasterWhisperTranscriber
 from .transform import Transformer, TransformCoordinator, TransformUnavailable
@@ -94,6 +94,23 @@ def _execute_voice_command(action: str, emitter: CorrectingEmitter, formatter) -
         if text:
             emitter.set_clipboard(text)
         formatter.reseed(emitter.previous_logical)
+
+
+def session_join_timeout(cfg: Config) -> float:
+    """Upper bound on legitimate session-thread shutdown work.
+
+    Derived from the same budgets the thread itself honors, so a healthy
+    thread is never declared wedged (the old fixed 10 s join was *shorter*
+    than the shutdown path's own timeouts, producing spurious "did not stop
+    in time" errors and orphaned threads holding the mic and emitter):
+
+    - finalize(): worst case waits a timed-out speculative final decode
+      plus a fresh one — 2 × FINAL_DECODE_TIMEOUT_S;
+    - coordinator.drain(): the in-flight transform's full LLM budget,
+      cfg.contextual.timeout_s (config-validated ≤ 60);
+    - margin for typing the final sync/replacement and teardown.
+    """
+    return 2.0 * FINAL_DECODE_TIMEOUT_S + cfg.contextual.timeout_s + 10.0
 
 
 class _CaptureManager:
@@ -409,7 +426,7 @@ def run() -> int:
         if session_thread is None:
             return
         stop_event.set()
-        session_thread.join(timeout=10.0)
+        session_thread.join(timeout=session_join_timeout(cfg))
         if session_thread.is_alive():
             _emit("error", msg="session thread did not stop in time")
         session_thread = None

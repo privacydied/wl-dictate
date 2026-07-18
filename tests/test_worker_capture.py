@@ -82,3 +82,21 @@ def test_dead_stream_reopened(monkeypatch):
     cap.active = False  # stream died underneath
     again = mgr.acquire(1, "mic")
     assert again is not cap
+
+# ── Timeout budget coherence ─────────────────────────────────────────────────
+
+
+def test_session_join_timeout_covers_shutdown_budgets():
+    """The join timeout must outlast every budget the shutdown path honors:
+    worst-case finalize (speculative + fresh final decode) plus the
+    transform drain budget. A join shorter than the thread's own legitimate
+    work produces spurious wedge errors and orphaned threads."""
+    from wldictate.config import Config
+    from wldictate.streaming import FINAL_DECODE_TIMEOUT_S
+    from wldictate.worker import session_join_timeout
+
+    cfg = Config()
+    assert session_join_timeout(cfg) > 2 * FINAL_DECODE_TIMEOUT_S + cfg.contextual.timeout_s
+
+    cfg.contextual.timeout_s = 60.0  # config-validated maximum
+    assert session_join_timeout(cfg) > 2 * FINAL_DECODE_TIMEOUT_S + 60.0
