@@ -115,8 +115,42 @@ def _guess_wayland_env(env: dict[str, str]) -> None:
             return
 
 
+#: TTL cache for the hyprctl subprocess fallback: never more than one spawn
+#: per _FALLBACK_TTL_S even when the event-socket tracker is unavailable.
+_FALLBACK_TTL_S = 2.0
+_fallback_lock = threading.Lock()
+_fallback_at = 0.0
+_fallback_result: tuple[str, str] = ("", "")
+
+
 def focused_window(env: dict[str, str]) -> tuple[str, str]:
-    """(class, title) of the focused window; ("", "") if unknown/not Hyprland."""
+    """(class, title) of the focused window; ("", "") if unknown/not Hyprland.
+
+    Served from the Hyprland event-socket cache (one persistent
+    subscription, zero subprocesses — see ``wldictate.hypr``); the hyprctl
+    subprocess remains as a TTL-cached fallback for sessions where the
+    event socket is unavailable.
+    """
+    from . import hypr
+
+    tracker = hypr.get_focus_tracker(env)
+    if tracker is not None and tracker.ok:
+        return tracker.focused()
+
+    global _fallback_at, _fallback_result
+    import time as _time
+
+    now = _time.monotonic()
+    with _fallback_lock:
+        if now - _fallback_at < _FALLBACK_TTL_S:
+            return _fallback_result
+    result = _focused_window_subprocess(env)
+    with _fallback_lock:
+        _fallback_at, _fallback_result = now, result
+    return result
+
+
+def _focused_window_subprocess(env: dict[str, str]) -> tuple[str, str]:
     try:
         result = subprocess.run(
             ["hyprctl", "-j", "activewindow"],
