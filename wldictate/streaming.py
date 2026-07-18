@@ -335,6 +335,14 @@ class StreamingSession:
         raw = self._trimmed_raw + "".join(w.text for w in words)
         self._last_raw = raw
         desired = self._formatter.peek(raw) if raw.strip() else ""
+        publish = getattr(self._emitter, "publish", None)
+        if publish is not None:
+            # Latest-wins async render: never blocks the session loop, and a
+            # hypothesis superseded before it was typed is skipped entirely.
+            # Failures freeze the emitter (reported by the render thread);
+            # the finalize-time sync — a barrier — still observes them.
+            publish(desired)
+            return
         if not self._emitter.sync(desired):
             self._render_ok = False
             self._error("emitter failed to sync tentative text")

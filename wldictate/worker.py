@@ -18,6 +18,7 @@ from .audio import AudioCapture
 from .commands import match_command, strip_literal
 from .config import Config
 from .emitter import CorrectingEmitter, make_emitter
+from .render import RenderProxy
 from .streaming import StreamingSession
 from .textproc import TextFormatter
 from .transcriber import FasterWhisperTranscriber
@@ -41,7 +42,7 @@ def _handle_final(final, emitter, formatter, coordinator, merge_all=False) -> No
     contextual transform (in that priority order)."""
     if not final:
         return
-    correcting = isinstance(emitter, CorrectingEmitter)
+    correcting = isinstance(getattr(emitter, "wrapped", emitter), CorrectingEmitter)
     if not merge_all:  # a rollover chain is one long message, never a command
         command = match_command(final)
         if command and correcting:
@@ -162,13 +163,19 @@ def _run_session(
     # correcting emitter — force it regardless of typing.mode.
     contextual = mode == "contextual" and transformer is not None
     typing_mode = "correcting" if contextual else cfg.typing.mode
-    emitter = make_emitter(
-        typing_mode,
-        wtype_timeout_s=cfg.typing.wtype_timeout_s,
-        wtype_delay_ms=cfg.typing.wtype_delay_ms,
-        wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
-        electron_workaround=cfg.typing.electron_workaround,
-        electron_classes=cfg.typing.electron_app_classes,
+    # RenderProxy moves all typing I/O onto a dedicated render thread with
+    # latest-wins coalescing, so the session loop (VAD + decode dispatch)
+    # never blocks behind keystroke delivery.
+    emitter = RenderProxy(
+        make_emitter(
+            typing_mode,
+            wtype_timeout_s=cfg.typing.wtype_timeout_s,
+            wtype_delay_ms=cfg.typing.wtype_delay_ms,
+            wtype_press_delay_ms=cfg.typing.wtype_press_delay_ms,
+            electron_workaround=cfg.typing.electron_workaround,
+            electron_classes=cfg.typing.electron_app_classes,
+        ),
+        on_error=lambda msg: _emit("error", msg=msg),
     )
     # Fresh formatter per session: the cursor may have moved anywhere between
     # toggles, so spacing context must never leak across sessions (a stale
@@ -210,7 +217,7 @@ def _run_session(
     if contextual:
         coordinator = TransformCoordinator(
             transformer,
-            emitter,  # make_emitter("correcting", ...) → CorrectingEmitter
+            emitter,  # RenderProxy over a CorrectingEmitter (barrier ops)
             formatter,
             timeout_s=cfg.contextual.timeout_s,
             notify_enabled=cfg.contextual.notify,
@@ -303,6 +310,10 @@ def _run_session(
             coordinator.shutdown()
         try:
             session.stop()
+        except Exception:
+            pass
+        try:
+            emitter.close()  # drain + stop the render thread
         except Exception:
             pass
         _emit("stopped")
