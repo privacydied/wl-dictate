@@ -274,13 +274,12 @@ class WtypeEmitter(Emitter):
             return ""
         vk = self._vkbd()
         if vk is not None:
-            # The Electron gate is per *connection*; ours is persistent, so
-            # only the very first key of the whole connection can be eaten.
-            if (
-                backspaces == 0
-                and vk.keys_sent == 0
-                and self._needs_electron_gate(text)
-            ):
+            # Electron gate per EMISSION, exactly like the wtype path.
+            # (Empirically Chromium re-arms the leading-space drop per input
+            # burst, not per connection — gating only the first key of the
+            # persistent connection brought the glitch back: "YoWhat'the".)
+            # Pure appends only: backspaces themselves open the gate.
+            if backspaces == 0 and self._needs_electron_gate(text):
                 text = self._ZWSP + text
             sent_before = vk.keys_sent
             try:

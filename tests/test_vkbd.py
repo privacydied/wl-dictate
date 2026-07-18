@@ -191,13 +191,22 @@ def test_rewrite_partial_delivery_returns_none(fake_vkbd, monkeypatch):
     assert e.rewrite(0, "hello") is None
 
 
-def test_electron_gate_only_before_first_key_on_connection(fake_vkbd, monkeypatch):
+def test_electron_gate_fires_per_emission(fake_vkbd, monkeypatch):
+    # Chromium re-arms the leading-space drop per input burst, so EVERY pure
+    # append with a leading space into an Electron app gets the ZWSP —
+    # identical to the wtype-subprocess behavior.
     e = WtypeEmitter(backend="auto", delay_ms=0)
     monkeypatch.setattr(e, "_focused_window_class", lambda: "vesktop")
-    assert e.rewrite(0, " one") == ZWSP + " one"  # fresh connection: gated
-    assert e.rewrite(0, " two") == " two"  # gate already open: no ZWSP
+    assert e.rewrite(0, " one") == ZWSP + " one"
+    assert e.rewrite(0, " two") == ZWSP + " two"
+    # Rewrites with backspaces open the gate themselves: no ZWSP.
+    assert e.rewrite(2, " three") == " three"
     typed = [c for c in fake_vkbd.calls if c[0] == "text"]
-    assert typed == [("text", ZWSP + " one"), ("text", " two")]
+    assert typed == [
+        ("text", ZWSP + " one"),
+        ("text", ZWSP + " two"),
+        ("text", " three"),
+    ]
 
 
 def test_press_key_routes_through_vkbd(fake_vkbd, monkeypatch):
