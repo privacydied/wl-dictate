@@ -241,7 +241,7 @@ Examples (transcript -> output):
 #: Output prefix marking a revision of the previous output (see SYSTEM_PROMPT).
 REVISE_MARKER = "@@REVISE@@"
 
-_USER_TEMPLATE = """\
+_USER_TEMPLATE_PREFIX = """\
 FOCUSED WINDOW: class={window_class} title={window_title}
 
 PRIMARY SELECTION:
@@ -250,19 +250,29 @@ PRIMARY SELECTION:
 CLIPBOARD:
 {clipboard}
 
-TRANSCRIPT:
-{transcript}
 """
 
 
-def build_user_message(context: ScreenContext, transcript: str) -> str:
-    return _USER_TEMPLATE.format(
+def _user_prefix(context: ScreenContext, hint: str = "") -> str:
+    """Everything before the transcript — including the app hint, which
+    deliberately sits BEFORE ``TRANSCRIPT:`` so the whole prefix is
+    byte-identical between the prewarm request (empty transcript) and the
+    real one. Both prompt caches key on the longest common prefix (llama.cpp
+    KV reuse and Anthropic cache_control), so the split point must be after
+    everything stable and before the only thing that changes."""
+    prefix = _USER_TEMPLATE_PREFIX.format(
         window_class=context.window_class or "(unknown)",
         window_title=context.window_title or "(unknown)",
         selection=context.selection or "(empty)",
         clipboard=context.clipboard or "(empty)",
-        transcript=transcript,
     )
+    if hint:
+        prefix += f"APP GUIDANCE: {hint}\n\n"
+    return prefix + "TRANSCRIPT:\n"
+
+
+def build_user_message(context: ScreenContext, transcript: str) -> str:
+    return _user_prefix(context) + transcript
 
 
 def _clean_partial(raw: str) -> tuple[str, bool]:
@@ -401,20 +411,31 @@ class OpenAICompatBackend:
                     yield delta
 
     @staticmethod
-    def user_content(text: str, screenshot: bytes | None):
+    def user_content(prefix: str, transcript: str, screenshot: bytes | None):
         if screenshot is None:
-            return text
+            return prefix + transcript
         b64 = base64.standard_b64encode(screenshot).decode("ascii")
         return [
             # Image first: the text template stays a stable suffix, and the
             # prewarm request's KV prefix matches the real request's.
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            {"type": "text", "text": text},
+            {"type": "text", "text": prefix + transcript},
         ]
 
 
 class AnthropicBackend:
-    """Anthropic API via the official SDK."""
+    """Anthropic API via the official SDK.
+
+    Caching parity with the llama.cpp path: the (session-stable) system
+    prompt and the per-utterance context prefix carry ``cache_control``
+    breakpoints, and :meth:`prewarm` runs a ``max_tokens: 0`` prefill —
+    the documented cache pre-warm pattern — while the user is still
+    speaking, so the real request reads the just-written cache and only
+    pays prefill for the transcript. Verify with
+    ``usage.cache_read_input_tokens``; note prefixes below the model's
+    minimum cacheable size (1024–4096 tokens depending on model) silently
+    don't cache, in which case prewarm buys nothing.
+    """
 
     is_local = False
 
@@ -425,13 +446,40 @@ class AnthropicBackend:
             api_key=api_key, timeout=timeout_s, max_retries=0
         )
 
+    @staticmethod
+    def _system_blocks(system: str) -> list[dict]:
+        # Stable for the whole session (Transformer builds it once), so
+        # every transform after the first reads it from cache (~0.1x cost).
+        return [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    def prewarm(
+        self, system: str, messages: list[dict], *, model: str
+    ) -> None:
+        """Speculative prefill at utterance start: ``max_tokens: 0`` runs
+        prefill (writing the cache at the breakpoints) and returns
+        immediately with no output tokens billed. Costs one cache write of
+        system+history+context per utterance, repaid by the real request's
+        cache read and its lower time-to-first-token."""
+        self._client.messages.create(
+            model=model,
+            max_tokens=0,
+            system=self._system_blocks(system),
+            messages=messages,
+        )
+
     def complete(
         self, system: str, messages: list[dict], *, model: str, max_tokens: int
     ) -> str:
         response = self._client.messages.create(
             model=model,
             max_tokens=max_tokens,
-            system=system,
+            system=self._system_blocks(system),
             messages=messages,
         )
         return "".join(b.text for b in response.content if b.type == "text")
@@ -440,27 +488,42 @@ class AnthropicBackend:
         self, system: str, messages: list[dict], *, model: str, max_tokens: int
     ):
         with self._client.messages.stream(
-            model=model, max_tokens=max_tokens, system=system, messages=messages
+            model=model,
+            max_tokens=max_tokens,
+            system=self._system_blocks(system),
+            messages=messages,
         ) as stream:
             for text in stream.text_stream:
                 yield text
 
     @staticmethod
-    def user_content(text: str, screenshot: bytes | None):
-        if screenshot is None:
-            return text
-        b64 = base64.standard_b64encode(screenshot).decode("ascii")
-        return [
+    def user_content(prefix: str, transcript: str, screenshot: bytes | None):
+        """Split blocks so the context prefix is cache-shareable between the
+        prewarm request (no transcript block) and the real one: the prefix
+        block carries the breakpoint, the transcript rides after it."""
+        blocks: list[dict] = []
+        if screenshot is not None:
+            b64 = base64.standard_b64encode(screenshot).decode("ascii")
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64,
+                    },
+                }
+            )
+        blocks.append(
             {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": b64,
-                },
-            },
-            {"type": "text", "text": text},
-        ]
+                "type": "text",
+                "text": prefix,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+        if transcript:
+            blocks.append({"type": "text", "text": transcript})
+        return blocks
 
 
 def resolve_api_key(profile: ContextualProfile) -> str:
@@ -578,14 +641,16 @@ class Transformer:
             pass  # purely opportunistic
 
     def _user_content(self, context: ScreenContext, transcript: str):
-        text = build_user_message(context, transcript)
-        hint = self._app_hint(context.window_class)
-        if hint:
-            text += f"\nAPP GUIDANCE: {hint}\n"
+        # The prefix (window/selection/clipboard/app hint, ending at
+        # "TRANSCRIPT:\n") is byte-identical between the prewarm request and
+        # the real one — the transcript is the only difference — so backend
+        # prompt caches (llama.cpp KV reuse, Anthropic cache_control) cover
+        # everything but the words actually spoken.
+        prefix = _user_prefix(context, self._app_hint(context.window_class))
         user_content = getattr(self._backend, "user_content", None)
         if user_content is None:
-            return text
-        return user_content(text, context.screenshot)
+            return prefix + transcript
+        return user_content(prefix, transcript, context.screenshot)
 
     def _app_hint(self, window_class: str) -> str:
         cls = window_class.lower()

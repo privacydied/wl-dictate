@@ -295,3 +295,95 @@ def test_clean_preserves_legitimate_colons():
 def test_clean_never_strips_to_nothing():
     # An output that IS just a label-looking string stays rather than vanishing.
     assert _clean_output("Translation:") == "Translation:"
+
+
+# ── Anthropic prompt caching + prewarm ───────────────────────────────────────
+
+
+def test_anthropic_system_blocks_carry_cache_control():
+    from wldictate.transform import AnthropicBackend
+
+    blocks = AnthropicBackend._system_blocks("SYS")
+    assert blocks == [
+        {"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+def test_anthropic_user_content_splits_prefix_and_transcript():
+    from wldictate.transform import AnthropicBackend
+
+    blocks = AnthropicBackend.user_content("PREFIX\nTRANSCRIPT:\n", "hello", None)
+    assert blocks[0]["text"] == "PREFIX\nTRANSCRIPT:\n"
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[1] == {"type": "text", "text": "hello"}
+    # Prewarm shape (no transcript): the prefix block alone — its bytes are
+    # identical to the real request's first block, so the cache prefix holds.
+    warm = AnthropicBackend.user_content("PREFIX\nTRANSCRIPT:\n", "", None)
+    assert warm == blocks[:1]
+
+
+def test_anthropic_prewarm_sends_zero_max_tokens(monkeypatch):
+    from wldictate.transform import AnthropicBackend
+
+    backend = AnthropicBackend.__new__(AnthropicBackend)
+
+    class Messages:
+        def __init__(self):
+            self.kw = None
+
+        def create(self, **kw):
+            self.kw = kw
+            return SimpleNamespace(content=[])
+
+    class Client:
+        def __init__(self):
+            self.messages = Messages()
+
+    from types import SimpleNamespace
+
+    backend._client = Client()
+    backend.prewarm("SYS", [{"role": "user", "content": "ctx"}], model="claude-x")
+    kw = backend._client.messages.kw
+    assert kw["max_tokens"] == 0  # prefill-only: writes the cache, no output
+    assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert kw["model"] == "claude-x"
+
+
+def test_prewarm_and_real_request_share_identical_prefix(monkeypatch):
+    """The whole point: everything before the transcript must be
+    byte-identical between the prewarm and the real request."""
+    from wldictate.config import ContextualConfig
+    from wldictate.transform import Transformer
+    import wldictate.transform as tm
+
+    class Recorder:
+        is_local = True
+
+        def __init__(self):
+            self.contents = []
+
+        @staticmethod
+        def user_content(prefix, transcript, screenshot):
+            return [{"prefix": prefix, "transcript": transcript}]
+
+        def prewarm(self, system, messages, *, model):
+            self.contents.append(messages[-1]["content"])
+
+        def complete(self, system, messages, *, model, max_tokens):
+            self.contents.append(messages[-1]["content"])
+            return "ok"
+
+    cfg = ContextualConfig()
+    cfg.app_hints = {"vesktop": "casual"}
+    rec = Recorder()
+    monkeypatch.setattr(tm, "make_backend", lambda *a, **k: rec)
+    ctx = tm.ScreenContext(window_class="vesktop", selection="sel")
+    tr = Transformer(cfg)
+    tr.prewarm(ctx)
+    tr.transform("the words", context=ctx)
+    warm, real = rec.contents
+    assert warm[0]["prefix"] == real[0]["prefix"]
+    assert warm[0]["transcript"] == ""
+    assert real[0]["transcript"] == "the words"
+    assert "APP GUIDANCE: casual" in real[0]["prefix"]
+    assert real[0]["prefix"].endswith("TRANSCRIPT:\n")
