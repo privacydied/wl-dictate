@@ -387,3 +387,73 @@ def test_prewarm_and_real_request_share_identical_prefix(monkeypatch):
     assert real[0]["transcript"] == "the words"
     assert "APP GUIDANCE: casual" in real[0]["prefix"]
     assert real[0]["prefix"].endswith("TRANSCRIPT:\n")
+
+
+# ── max_tokens truncation must fail loudly, never apply a cut-off rewrite ────
+
+
+def _fake_openai_backend(monkeypatch, completions):
+    from wldictate.transform import OpenAICompatBackend
+
+    def fake_init(self, base_url, api_key, timeout_s):
+        self._is_openrouter = False
+        self._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+
+    monkeypatch.setattr(OpenAICompatBackend, "__init__", fake_init)
+    return OpenAICompatBackend("http://127.0.0.1:8890/v1", "", 5.0)
+
+
+def test_openai_complete_raises_on_length_finish(monkeypatch):
+    from wldictate.transform import TransformTruncated
+
+    class Completions:
+        def create(self, **kwargs):
+            msg = SimpleNamespace(content="cut off mid-")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="length")]
+            )
+
+    b = _fake_openai_backend(monkeypatch, Completions())
+    with pytest.raises(TransformTruncated):
+        b.complete("s", [], model="m", max_tokens=10)
+
+
+def test_openai_stream_raises_on_length_finish(monkeypatch):
+    from wldictate.transform import TransformTruncated
+
+    def chunk(content=None, finish=None):
+        delta = SimpleNamespace(content=content)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish)]
+        )
+
+    class Completions:
+        def create(self, **kwargs):
+            assert kwargs.get("stream") is True
+            return iter([chunk("Hello "), chunk("wor"), chunk(finish="length")])
+
+    b = _fake_openai_backend(monkeypatch, Completions())
+    got = []
+    with pytest.raises(TransformTruncated):
+        for delta in b.complete_stream("s", [], model="m", max_tokens=10):
+            got.append(delta)
+    assert got == ["Hello ", "wor"]  # deltas still streamed before the raise
+
+
+def test_openai_stream_ok_on_stop_finish(monkeypatch):
+    def chunk(content=None, finish=None):
+        delta = SimpleNamespace(content=content)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish)]
+        )
+
+    class Completions:
+        def create(self, **kwargs):
+            return iter([chunk("Complete."), chunk(finish="stop")])
+
+    b = _fake_openai_backend(monkeypatch, Completions())
+    assert list(b.complete_stream("s", [], model="m", max_tokens=10)) == [
+        "Complete."
+    ]

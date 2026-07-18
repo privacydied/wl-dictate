@@ -208,3 +208,17 @@ def test_streaming_session_publishes_through_proxy():
     assert final == "the quick"
     session.stop()
     proxy.close()
+
+
+def test_publish_forwards_max_backspaces_for_transform_apply():
+    """The streamed-transform apply publishes with the full-replacement
+    backspace budget; the default publish cap (500) would refuse to rewrite
+    a long region and the apply would silently stall."""
+    proxy, device = make_proxy()
+    proxy.begin_utterance()
+    long_text = "x" * 600
+    assert proxy.sync(long_text, max_backspaces=1000)
+    proxy.publish("short replacement", max_backspaces=4000)
+    proxy.flush()
+    assert device.screen == "short replacement"
+    proxy.close()

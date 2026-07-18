@@ -620,3 +620,91 @@ def test_press_tab_and_escape_reset_regions():
     assert h.device.screen == ""
     assert h.emitter.previous_len == 0  # ownership reset
     h.coordinator.shutdown()
+
+
+# ── mid-stream death must not strand a half-replaced message ─────────────────
+
+
+class GatedStreamTransformer(FakeTransformer):
+    """Yields one chunk, then blocks until released, then raises/ends."""
+
+    def __init__(self, first_chunk, then):
+        super().__init__(reply="unused")
+        self.first_chunk = first_chunk
+        self.then = then  # Exception to raise, or None to just end
+        self.proceed = threading.Event()
+
+    def transform_stream(self, transcript, context=None, history=()):
+        yield self.first_chunk
+        assert self.proceed.wait(timeout=5.0)
+        if isinstance(self.then, Exception):
+            raise self.then
+
+
+def _gated_harness(first_chunk, then):
+    h = _stream_harness([])
+    h.transformer = GatedStreamTransformer(first_chunk, then)
+    h.coordinator.shutdown()
+    h.coordinator = TransformCoordinator(
+        h.transformer,
+        h.emitter,
+        h.formatter,
+        timeout_s=5.0,
+        notify_enabled=False,
+        stream_enabled=True,
+        on_error=h.errors.append,
+    )
+    return h
+
+
+def _poll_until(h, predicate, timeout=5.0):
+    for _ in range(int(timeout * 100)):
+        h.coordinator.poll()
+        if predicate():
+            return True
+        threading.Event().wait(0.01)
+    return False
+
+
+def test_streaming_error_mid_apply_restores_dictated_text(monkeypatch):
+    monkeypatch.setattr(transform_mod, "notify", lambda *a, **k: None)
+    h = _gated_harness("Half a rewri", RuntimeError("model died mid-stream"))
+    final = h.speak_utterance(" the full dictated message.")
+    h.coordinator.submit(final)
+    # Partial replacement reaches the screen first.
+    assert _poll_until(h, lambda: "Half a rewri" in h.device.screen)
+    h.transformer.proceed.set()
+    assert _poll_until(h, lambda: h.coordinator._stream is None)
+    # The stream died: the FULL dictated text is restored, not the partial.
+    assert h.device.screen == final
+    assert h.errors
+    h.coordinator.shutdown()
+
+
+def test_streaming_truncation_restores_dictated_text(monkeypatch):
+    from wldictate.transform import TransformTruncated
+
+    monkeypatch.setattr(transform_mod, "notify", lambda *a, **k: None)
+    h = _gated_harness(
+        "Truncated rew", TransformTruncated("output hit max_output_tokens")
+    )
+    final = h.speak_utterance(" a very long dictated message.")
+    h.coordinator.submit(final)
+    assert _poll_until(h, lambda: "Truncated rew" in h.device.screen)
+    h.transformer.proceed.set()
+    assert _poll_until(h, lambda: h.coordinator._stream is None)
+    assert h.device.screen == final
+    assert any("max_output_tokens" in e for e in h.errors)
+    h.coordinator.shutdown()
+
+
+def test_cancel_mid_stream_restores_dictated_text():
+    h = _gated_harness("Partially repla", None)
+    final = h.speak_utterance(" words that must survive.")
+    h.coordinator.submit(final)
+    assert _poll_until(h, lambda: "Partially repla" in h.device.screen)
+    # New utterance starts while the rewrite is mid-apply.
+    h.coordinator.cancel_pending()
+    assert h.device.screen == final  # dictated text back, nothing stranded
+    h.transformer.proceed.set()  # let the generator finish
+    h.coordinator.shutdown()

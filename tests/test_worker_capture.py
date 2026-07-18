@@ -100,3 +100,16 @@ def test_session_join_timeout_covers_shutdown_budgets():
 
     cfg.contextual.timeout_s = 60.0  # config-validated maximum
     assert session_join_timeout(cfg) > 2 * FINAL_DECODE_TIMEOUT_S + 60.0
+
+
+def test_audio_queue_sized_by_duration_not_chunk_count():
+    """256 fixed chunks was 2.7 s at 48 kHz — session-loop stalls overflowed
+    it and silently dropped live speech (transcript cut off mid-utterance).
+    The queue must hold _QUEUE_MAX_SECONDS at the device rate."""
+    from wldictate.audio import AudioCapture, _QUEUE_MAX_SECONDS
+
+    for rate in (16000, 48000):
+        chunks = AudioCapture._queue_chunks(rate)
+        assert chunks * 512 / rate >= min(_QUEUE_MAX_SECONDS, 8.0)
+    # 48 kHz specifically must far exceed the old 256-chunk (~2.7 s) bound.
+    assert AudioCapture._queue_chunks(48000) * 512 / 48000 >= 20.0

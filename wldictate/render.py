@@ -67,7 +67,8 @@ class RenderProxy(Emitter):
         self._wrapped = emitter
         self._on_error = on_error
         self._cv = threading.Condition()
-        self._pending: str | None = None  # newest published hypothesis
+        # Newest published (desired_text, max_backspaces) — latest wins.
+        self._pending: tuple[str, int | None] | None = None
         self._jobs: deque[_Job] = deque()
         self._closed = False
         self._publish_failing = False  # dedupe publish-failure reports
@@ -85,8 +86,11 @@ class RenderProxy(Emitter):
 
     # ── Async path (tentative hypothesis renders) ────────────────────────
 
-    def publish(self, desired: str) -> None:
+    def publish(self, desired: str, *, max_backspaces: int | None = None) -> None:
         """Latest-wins screen sync; never blocks the caller.
+
+        ``max_backspaces`` overrides the wrapped emitter's default cap (the
+        streamed-transform apply needs the full-replacement budget).
 
         Failures freeze the wrapped CorrectingEmitter (screen unknown) and
         are reported once via ``on_error``; the next barrier ``sync`` then
@@ -96,7 +100,7 @@ class RenderProxy(Emitter):
         with self._cv:
             if self._closed:
                 return
-            self._pending = desired
+            self._pending = (desired, max_backspaces)
             self._cv.notify()
 
     def flush(self) -> None:
@@ -151,20 +155,20 @@ class RenderProxy(Emitter):
                 # Pending publish first: any job still queued alongside it is
                 # a non-superseding barrier that arrived after the publish.
                 if self._pending is not None:
-                    job, desired = None, self._pending
+                    job, pending = None, self._pending
                     self._pending = None
                 elif self._jobs:
-                    job, desired = self._jobs.popleft(), None
+                    job, pending = self._jobs.popleft(), None
                 else:  # closed, queue drained
                     return
             if job is not None:
                 job.run()
             else:
-                self._do_publish(desired)
+                self._do_publish(*pending)
 
-    def _do_publish(self, desired: str) -> None:
+    def _do_publish(self, desired: str, max_backspaces: int | None = None) -> None:
         try:
-            ok = bool(self._wrapped.sync(desired))
+            ok = bool(self._wrapped.sync(desired, max_backspaces=max_backspaces))
         except Exception as e:  # defensive: a device bug must not kill the thread
             ok = False
             self._error(f"render failed: {e}")

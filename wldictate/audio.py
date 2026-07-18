@@ -27,7 +27,13 @@ import sounddevice as sd
 
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 512
-_QUEUE_MAX_CHUNKS = 256  # bounded: stalls drop audio instead of eating RAM
+#: Seconds of audio the queue can absorb while the consumer stalls (final
+#: decodes, transform applies). Sized by DURATION at the actual device rate:
+#: a fixed chunk count silently shrank with the rate — 256 × 512-sample
+#: chunks was 8.2 s at 16 kHz but only 2.7 s at 48 kHz, so a multi-second
+#: stall dropped live speech and the transcript lost words mid-utterance.
+#: 30 s @ 48 kHz ≈ 2 812 chunks × 2 KB ≈ 5.6 MB — still bounded.
+_QUEUE_MAX_SECONDS = 30.0
 
 
 # ── Device resolution ────────────────────────────────────────────────────────
@@ -144,7 +150,11 @@ class AudioCapture:
 
     def __init__(self, device: int | None) -> None:
         self._device = device
-        self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=_QUEUE_MAX_CHUNKS)
+        # Re-created in start() once the real device rate is known; this
+        # default only covers the window before the stream opens.
+        self._queue: queue.Queue[np.ndarray] = queue.Queue(
+            maxsize=self._queue_chunks(SAMPLE_RATE)
+        )
         self._dropped = 0
         self._drop_lock = threading.Lock()
         self._stream: sd.InputStream | None = None
@@ -180,9 +190,16 @@ class AudioCapture:
             except (queue.Empty, queue.Full):
                 pass
 
+    @staticmethod
+    def _queue_chunks(rate: int) -> int:
+        """Queue capacity in 512-sample chunks for ``_QUEUE_MAX_SECONDS``."""
+        return max(256, int(rate * _QUEUE_MAX_SECONDS / 512))
+
     def start(self) -> None:
         last_error: Exception | None = None
         for rate in self._candidate_rates():
+            # Size the queue for THIS rate before the callback can fire.
+            self._queue = queue.Queue(maxsize=self._queue_chunks(rate))
             try:
                 stream = sd.InputStream(
                     samplerate=rate,

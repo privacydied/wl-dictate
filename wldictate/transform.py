@@ -68,6 +68,13 @@ class TransformError(Exception):
     """The transform failed (network, timeout, empty output, ...)."""
 
 
+class TransformTruncated(TransformError):
+    """The model hit ``max_output_tokens`` mid-rewrite: the output is an
+    incomplete replacement and must never be applied over the full message
+    (thinking models spend a variable share of the budget on ``<think>``
+    blocks, so this fires randomly on long dictations)."""
+
+
 class TransformUnavailable(Exception):
     """The transform cannot be constructed (missing key, bad profile, ...)."""
 
@@ -389,6 +396,8 @@ class OpenAICompatBackend:
             extra_body=extra_body or None,
         )
         choice = response.choices[0] if response.choices else None
+        if choice is not None and getattr(choice, "finish_reason", None) == "length":
+            raise TransformTruncated("output hit max_output_tokens mid-rewrite")
         return (choice.message.content or "") if choice else ""
 
     def complete_stream(
@@ -404,11 +413,18 @@ class OpenAICompatBackend:
             extra_body=extra_body or None,
             stream=True,
         )
+        finish_reason = None
         for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is not None and delta.content:
+                yield delta.content
+        if finish_reason == "length":
+            raise TransformTruncated("output hit max_output_tokens mid-rewrite")
 
     @staticmethod
     def user_content(prefix: str, transcript: str, screenshot: bytes | None):
@@ -482,6 +498,8 @@ class AnthropicBackend:
             system=self._system_blocks(system),
             messages=messages,
         )
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise TransformTruncated("output hit max_output_tokens mid-rewrite")
         return "".join(b.text for b in response.content if b.type == "text")
 
     def complete_stream(
@@ -495,6 +513,9 @@ class AnthropicBackend:
         ) as stream:
             for text in stream.text_stream:
                 yield text
+            final = stream.get_final_message()
+            if getattr(final, "stop_reason", None) == "max_tokens":
+                raise TransformTruncated("output hit max_output_tokens mid-rewrite")
 
     @staticmethod
     def user_content(prefix: str, transcript: str, screenshot: bytes | None):
@@ -681,6 +702,8 @@ class Transformer:
                 model=self._profile.model,
                 max_tokens=self._cfg.max_output_tokens,
             )
+        except TransformError:
+            raise  # already precise (e.g. TransformTruncated)
         except Exception as e:  # SDK errors, timeouts, network
             raise TransformError(f"{type(e).__name__}: {e}") from e
         text = _clean_output(raw)
@@ -720,6 +743,8 @@ class Transformer:
                 model=self._profile.model,
                 max_tokens=self._cfg.max_output_tokens,
             )
+        except TransformError:
+            raise  # already precise (e.g. TransformTruncated)
         except Exception as e:  # SDK errors, timeouts, network
             raise TransformError(f"{type(e).__name__}: {e}") from e
 
@@ -825,6 +850,10 @@ class TransformCoordinator:
                 "merged": False,  # previous region folded in (revise/merge_all)
                 "merge_all": merge_all,  # rollover chain: rewrite it all
                 "typed": False,  # anything synced yet
+                # Full pre-replacement text of the region(s) being rewritten:
+                # the restore target if the stream dies or is cancelled after
+                # it started replacing the screen. Captured at first render.
+                "restore": None,
             }
         else:
 
@@ -846,7 +875,13 @@ class TransformCoordinator:
         """Discard any in-flight transform (a new utterance is starting)."""
         self._generation += 1
         self._pending = None
-        self._stream = None  # partial replacement (if any) simply stays
+        stream, self._stream = self._stream, None
+        if stream is not None and stream["typed"]:
+            # The rewrite had started replacing the screen: put the full
+            # dictated text back instead of stranding a half-replaced
+            # message. Published (non-blocking); the new utterance's
+            # begin_utterance barrier queues behind it on the render thread.
+            self._restore_original(stream)
 
     def poll(self) -> None:
         """Apply completed/streaming transform work. Session-loop thread only."""
@@ -871,7 +906,11 @@ class TransformCoordinator:
             while self._stream is not None and time.monotonic() < deadline:
                 self._poll_stream(block=True, block_s=0.05)
             if self._stream is not None:
-                self._stream = None
+                state, self._stream = self._stream, None
+                if state["typed"]:
+                    # Blocking: the session is tearing down and close() would
+                    # discard a pending publish before it was typed.
+                    self._restore_original(state, block=True)
                 self._fail("transform timed out")
             return
         if self._pending is None:
@@ -912,11 +951,13 @@ class TransformCoordinator:
             elif kind == "error":
                 self._stream = None
                 if state["typed"]:
-                    # Partial replacement is on screen — keep it, fix state.
-                    self._formatter.reseed(self._emitter.logical)
-                    self._error(f"transform stream failed mid-apply: {payload}")
-                else:
-                    self._fail(str(payload))
+                    # A partial replacement is on screen. The LLM side died
+                    # (emitter failures are handled in _stream_progress, so
+                    # the screen state is known): restore the user's full
+                    # dictated text rather than stranding a half-replaced
+                    # message that reads as a random cut-off.
+                    self._restore_original(state)
+                self._fail(str(payload))
                 return
             else:  # done
                 self._stream = None
@@ -938,9 +979,20 @@ class TransformCoordinator:
         if state["prefix"] is None:
             base = self._emitter.logical if state["merged"] else state["original"]
             state["prefix"] = base[: len(base) - len(base.lstrip())]
-        if not self._emitter.sync(
-            state["prefix"] + partial, max_backspaces=_TRANSFORM_MAX_BACKSPACES
-        ):
+            state["restore"] = base
+        desired = state["prefix"] + partial
+        publish = getattr(self._emitter, "publish", None)
+        if publish is not None:
+            # Latest-wins async apply: a barrier sync here blocked the
+            # session loop for seconds on long rewrites (~6 ms/keystroke),
+            # long enough to overflow the mic queue and silently drop live
+            # speech. A partial superseded before it was typed is skipped
+            # entirely; failures freeze the emitter and are observed by the
+            # finalize-time barrier sync.
+            publish(desired, max_backspaces=_TRANSFORM_MAX_BACKSPACES)
+            state["typed"] = True
+            return
+        if not self._emitter.sync(desired, max_backspaces=_TRANSFORM_MAX_BACKSPACES):
             self._stream = None
             self._error("emitter failed during streamed transform")
             return
@@ -950,9 +1002,8 @@ class TransformCoordinator:
         cleaned = _clean_output(state["raw"])
         if not cleaned:
             if state["typed"]:
-                self._formatter.reseed(self._emitter.logical)
-            else:
-                self._fail("empty transform output")
+                self._restore_original(state)
+            self._fail("empty transform output")
             return
         reply = cleaned
         revise = cleaned.startswith(REVISE_MARKER)
@@ -1034,6 +1085,19 @@ class TransformCoordinator:
             self._error("emitter failed to apply transform")
             return
         self._history.append((original.strip(), reply))
+
+    def _restore_original(self, state: dict, *, block: bool = False) -> None:
+        """A streamed rewrite started replacing the screen but died or was
+        cancelled: put the user's full dictated text back. ``restore`` is the
+        pre-replacement text of the whole rewritten region (merged chains
+        included); ``original`` covers the pre-first-render edge case."""
+        restore = state.get("restore") or state["original"]
+        publish = getattr(self._emitter, "publish", None)
+        if publish is not None and not block:
+            publish(restore, max_backspaces=_TRANSFORM_MAX_BACKSPACES)
+        else:
+            self._emitter.sync(restore, max_backspaces=_TRANSFORM_MAX_BACKSPACES)
+        self._formatter.reseed(restore)
 
     def _fail(self, msg: str) -> None:
         self._error(f"transform failed (keeping dictated text): {msg}")
