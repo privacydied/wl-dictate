@@ -214,7 +214,7 @@ class DictationTrayApp:
             lambda: self.toggle_dictation("contextual")
         )
         self.reload_action = self.menu.addAction("Reload Devices")
-        self.reload_action.triggered.connect(self.reload_devices)
+        self.reload_action.triggered.connect(self.restart_service)
         self.quit_action = self.menu.addAction("Quit")
         self.quit_action.triggered.connect(self.quit_app)
         self.tray_icon.setContextMenu(self.menu)
@@ -545,6 +545,15 @@ class DictationTrayApp:
 
     # ── Devices ──────────────────────────────────────────────────────────
 
+    def restart_service(self) -> None:
+        """Restart the user service; systemd relaunches the tray with fresh devices."""
+        subprocess.Popen(
+            ["systemctl", "--user", "restart", "wl-dictate.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
     def reload_devices(self) -> None:
         import sounddevice as sd
 
@@ -575,7 +584,7 @@ class DictationTrayApp:
             action.triggered.connect(lambda _, i=idx: self.set_input_device(i))
         self.device_menu.addSeparator()
         reload_action = self.device_menu.addAction("Reload Devices")
-        reload_action.triggered.connect(self.reload_devices)
+        reload_action.triggered.connect(self.restart_service)
 
     def _get_input_device_info(self, device_idx):
         import sounddevice as sd
